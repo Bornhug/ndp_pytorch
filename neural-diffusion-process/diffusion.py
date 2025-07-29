@@ -117,7 +117,7 @@ class GaussianDiffusion:
         mean = a * (yt - b * noise)
         return mean + torch.sqrt(β_t) * z
 
-    # TODO: check again, seems ddpm_backward_mean_var never used
+    # TODO: check again, seems ddpm_backward_mean_var is never used
     # ---------------------------------------------- mean / var diagnostics
     def ddpm_backward_mean_var(self,
                                noise: torch.Tensor, # ε̂_θ [N, y_dim]
@@ -134,7 +134,7 @@ class GaussianDiffusion:
     # ----------------------------------------------------------- full sample
     def sample(self,
                key: torch.Generator,
-               x:   torch.Tensor,           # [N, x_dim]
+               x:   torch.Tensor,           # [B, x_dim]
                mask: torch.Tensor | None,
                *,
                model_fn: EpsModel,
@@ -146,10 +146,10 @@ class GaussianDiffusion:
         device = self.device
         B      = x.size(0)
         y = torch.randn(B, output_dim, device=device, dtype=self.dtype,
-                        generator=key)             # initial y_T
+                        generator=key)             # initial y_T [B, T]
 
         if mask is None:
-            mask = torch.zeros(B, device=device, dtype=self.dtype)
+            mask = torch.zeros(B, device=device, dtype=self.dtype) # [B]
 
         for t in reversed(range(len(self.betas))):
             g1, g2 = torch.Generator(device), torch.Generator(device)
@@ -262,12 +262,12 @@ def diffusion_loss(process: GaussianDiffusion,
     """
 
     metric = (lambda a, b: (a - b).abs()) if loss_type == "l1" \
-             else (lambda a, b: (a - b) ** 2)
+             else (lambda a, b: (a - b) ** 2) #l2 loss
 
     def single_point_loss(k: torch.Generator,
                           t: int,
-                          y: torch.Tensor,
-                          x: torch.Tensor,
+                          y: torch.Tensor, # [N, y_dim]
+                          x: torch.Tensor, # [N, x_dim]
                           mask: torch.Tensor):
         yt, noise = process.forward(k, y, torch.tensor(t, device=y.device))
         noise_hat = network(torch.tensor(t, device=y.device),
@@ -275,6 +275,7 @@ def diffusion_loss(process: GaussianDiffusion,
         per_point = metric(noise, noise_hat).sum(-1)      # [N]
         per_point = per_point * (1.0 - mask)              # ignore masked
         denom = len(mask) - mask.sum()
+        # len(mask) == N , mask.sum() == inactive points, so denom == active points
         return per_point.sum() / denom
 
     B = batch.x_target.size(0)
@@ -287,7 +288,7 @@ def diffusion_loss(process: GaussianDiffusion,
     t  = t0 + torch.arange(B, device=process.device) * (num_timesteps // B)
 
     # (ii) Default “all points valid” mask
-    mask_target = (torch.zeros_like(batch.x_target[..., 0])
+    mask_target = (torch.zeros_like(batch.x_target[..., 0])  # [B,N]
                    if batch.mask_target is None else batch.mask_target)
 
     # (iii) vmap via list comprehension (Python loop fine for small B)
@@ -297,9 +298,9 @@ def diffusion_loss(process: GaussianDiffusion,
         g.manual_seed(torch.randint(0, 2**63-1, (1,)).item())
         losses.append(single_point_loss(
             g, int(t[bi].item()),
-            batch.y_target[bi],
-            batch.x_target[bi],
-            mask_target[bi])
+            batch.y_target[bi], # [N, y_dim]
+            batch.x_target[bi], # [N, x_dim]
+            mask_target[bi])    # [N]
         )
 
     return torch.tensor(losses, device=process.device).mean()
