@@ -15,7 +15,7 @@ def timestep_embedding(t: torch.Tensor, embedding_dim: int, max_positions: int =
     if embedding_dim % 2 == 1:  # zero pad
         emb = F.pad(emb, (0, 1))
 
-    # emb : [t, embedding_dim] / [B, H]
+    # emb : [t, embedding_dim] OR [B, H]
 
     return emb
 
