@@ -7,9 +7,12 @@ import math
 
 def timestep_embedding(t: torch.Tensor, embedding_dim: int, max_positions: int = 10_000):
     """Sinusoidal embedding"""
+    if t.ndim == 0:
+        t = t.unsqueeze(0)  # 👈 fix: make scalar into [1]
+
     half_dim = embedding_dim // 2
     emb = math.log(max_positions) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=t.device) * -emb)
     emb = t[:, None] * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     if embedding_dim % 2 == 1:  # zero pad
@@ -122,6 +125,9 @@ class BiDimensionalAttentionBlock(nn.Module):
         y = s + t
         # y : [B, N, D, hidden_dim]
 
+        #TODO: Maybe alternative way is to reduce the input dim of Q,K,V to d_model/ ?
+        y = torch.cat([y, y], dim=-1)               # [B,N,D,2H]
+
         y_att_d = self.mha_d(y, y, y)
         # y_att_d : [B, N, D, hidden_dim]
 
@@ -197,21 +203,31 @@ class BiDimensionalAttentionModel(nn.Module):
         self.layers = nn.ModuleList(
             [BiDimensionalAttentionBlock(hidden_dim, num_heads) for _ in range(n_layers)]
         )
+        self.proj_eps = nn.Linear(hidden_dim, hidden_dim)
         self.output_linear = nn.Linear(hidden_dim, 1)
         if init_zero:
             nn.init.zeros_(self.output_linear.weight)
             nn.init.zeros_(self.output_linear.bias)
 
     def process_inputs(self, x, y):
-        # x : [B, N, D]  y : [B, N, 1]
+        # x : [B, N, D]  or [N, D]
+        # y : [B, N, 1]  or [N, 1]
 
-        num_x_dims = x.shape[-1]
+        if x.ndim == 2:  # [N,D]  →  add batch axis
+            x = x.unsqueeze(0)
+        if y.ndim == 2:  # [N,1]  →  add batch axis
+            y = y.unsqueeze(0)  # now [1,N,1]
 
-        x = x.unsqueeze(-1) # x : [B, N, D, 1]
+        if x.ndim == 3:
+            x = x.unsqueeze(-1)  # [B,N,D,1]
+        if y.ndim == 3:
+            y = y.unsqueeze(-1)  # [B,N,1,1]
 
-        y = y.unsqueeze(-1).repeat(1, 1, num_x_dims, 1) # y : [B, N, D, 1]
+        # y has shape [B,N,1,1];  need to tile along D so it matches x
+        if y.size(2) == 1 and x.size(2) > 1:
+            y = y.repeat(1, 1, x.size(2), 1)  # [B,N,D,1]
 
-        return torch.cat([x, y], dim=-1) # [B, N, D, 2]
+        return torch.cat([x, y], dim=-1)  # [B,N,D,2]
 
     def forward(self, x, y, t, mask=None):
         x = self.process_inputs(x, y) # [B, N, D, 2]
@@ -227,7 +243,7 @@ class BiDimensionalAttentionModel(nn.Module):
 
         skip = reduce(skip, "b n d h -> b n h", "mean") # [B, N ,H]
         eps = skip / math.sqrt(self.n_layers) # [B, N ,H]
-        eps = F.gelu(nn.Linear(self.hidden_dim, self.hidden_dim)(eps)) # [B, N ,H]
+        eps = F.gelu(self.proj_eps(eps))   # [B, N ,H]
         eps = self.output_linear(eps) # [B, N ,1]
         return eps
 

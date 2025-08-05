@@ -1,0 +1,212 @@
+# ---------------------------------------------------------------------
+# main_torch.py – PyTorch training loop for Neural Diffusion Processes
+# ---------------------------------------------------------------------
+from __future__ import annotations
+
+import argparse, datetime, math, pprint, random, string
+from dataclasses import asdict
+from pathlib import Path
+from functools import partial
+
+import matplotlib.pyplot as plt
+import torch, tqdm
+from torch import nn
+from torch.utils.data import DataLoader, IterableDataset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+
+import neural_diffusion_processes as ndp
+from neural_diffusion_processes.model import BiDimensionalAttentionModel
+from neural_diffusion_processes.process import GaussianDiffusion, cosine_schedule
+from neural_diffusion_processes.types import Batch
+from data import get_batch
+from config import Config
+
+# ------------------------------------------------------------------ #
+#  Helpers                                                           #
+# ------------------------------------------------------------------ #
+def _experiment_name() -> str:
+    now = datetime.datetime.now().strftime("%b%d_%H%M%S")
+    tag = "".join(random.choice(string.ascii_lowercase) for _ in range(4))
+    return f"{now}_{tag}"
+
+def _device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ------------------------------------------------------------------ #
+#  Dataset wrapper                                                   #
+# ------------------------------------------------------------------ #
+class InfiniteDataset(IterableDataset):
+    def __init__(self, cfg: Config, train: bool):
+        self.cfg, self.train = cfg, train
+        #self.gen = torch.Generator().manual_seed(cfg.seed)
+
+    def __iter__(self):
+        while True:
+            gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
+            yield get_batch(
+                gen,                                   # positional
+                batch_size=self.cfg.batch_size,
+                name=self.cfg.dataset,
+                task="training" if self.train else "interpolation",
+                input_dim=self.cfg.input_dim,
+            )
+
+# ------------------------------------------------------------------ #
+def build_network(cfg: Config) -> nn.Module:
+    return BiDimensionalAttentionModel(
+        n_layers   = cfg.network.n_layers,
+        hidden_dim = cfg.network.hidden_dim,
+        num_heads  = cfg.network.num_heads,
+    )
+
+def build_process(cfg: Config) -> GaussianDiffusion:
+    device = _device()
+    betas = cosine_schedule(cfg.diffusion.beta_start,
+                            cfg.diffusion.beta_end,
+                            cfg.diffusion.timesteps).to(device)
+    return GaussianDiffusion(betas)
+
+@torch.no_grad()
+def _ema_update(ema: nn.Module, online: nn.Module, decay: float):
+    for p_ema, p in zip(ema.parameters(), online.parameters()):
+        p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+
+def make_loss_fn(process: GaussianDiffusion, cfg: Config):
+    def _loss_fn(
+        model: torch.nn.Module,
+        batch: Batch,
+        key: torch.Generator,          # positional, not a kwarg
+    ) -> torch.Tensor:
+
+        # --- adapter: reorder args & ignore `key` -----------------
+        def eps_model(t, yt, x, mask, *, key):
+            # t: [B], yt: [B,N,1], x: [B,N,D], mask: [B,N]
+            return model(x, yt, t, mask)  # returns [B,N,1]
+
+        # pos. args: process, network, batch, key
+        # kw-only: num_timesteps, loss_type
+        return ndp.process.loss(
+            process,                    # GaussianDiffusion
+            eps_model,                      # your BiDim model
+            batch,                      # Batch instance
+            key,                        # <— here!
+            num_timesteps=cfg.diffusion.timesteps,
+            loss_type=cfg.loss_type,
+        )
+    return _loss_fn
+
+
+# ------------------------------------------------------------------ #
+def train(cfg: Config):
+    device  = _device()
+    log_dir = Path("logs") / "regression" / _experiment_name()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print("Logging to:", log_dir)
+
+    data = DataLoader(
+        InfiniteDataset(cfg, train=True),
+        batch_size=None,
+        num_workers=4,  # 🔁 Try 4–8, or more if you have CPU cores
+        prefetch_factor=2,  # Optional: prefetch batches to reduce wait time
+        pin_memory=True  # Useful for GPU transfers
+    )
+
+    model     = build_network(cfg).to(device)
+    model_ema = build_network(cfg).to(device)
+    model_ema.load_state_dict(model.state_dict())
+    process   = build_process(cfg)
+    loss_fn   = make_loss_fn(process, cfg)
+
+    # ---- optimiser & LR schedule (warm-up + cosine) ---------------------
+    opt = AdamW(model.parameters(),
+                lr=cfg.optimizer.peak_lr,
+                betas=(0.9, 0.999))                # weight_decay left at default 0
+
+    warmup_steps = cfg.steps_per_epoch * cfg.optimizer.num_warmup_epochs
+    total_steps  = cfg.total_steps
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return step / warmup_steps
+        prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * prog))
+
+    sched = LambdaLR(opt, lr_lambda)
+
+    device = _device()  # already cuda:0
+    gen = torch.Generator(device=device).manual_seed(cfg.seed)
+
+    # ---- training loop --------------------------------------------------
+    model.train()
+    pbar = tqdm.tqdm(range(1, total_steps + 1))
+
+    for step, batch in zip(pbar, data):
+        batch = Batch(**{k: v.to(device, non_blocking=True) for k, v in batch.__dict__.items()})
+
+        opt.zero_grad(set_to_none=True)
+        loss = loss_fn(model, batch, gen)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step(); sched.step()
+
+        _ema_update(model_ema, model, cfg.optimizer.ema_rate)
+
+        if step % 100 == 0 or step == 1:
+            pbar.set_description(f"loss {loss.item():.3f} • lr {sched.get_last_lr()[0]:.2e}")
+
+        if step % (total_steps // 8) == 0:
+            _plot_samples(model_ema, process, cfg, device,
+                          title=f"step_{step:07d}",
+                          out_dir=log_dir / "plots")
+
+        if step >= total_steps:
+            break
+
+    torch.save(model_ema.state_dict(), log_dir / "model_ema.pt")
+    print("Training complete – weights saved.")
+
+# ------------------------------------------------------------------ #
+@torch.no_grad()
+def _plot_samples(model, process, cfg, device, title, out_dir: Path):
+    if cfg.input_dim != 1:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    x = torch.linspace(-2, 2, 60, device=device).unsqueeze(-1)
+    #x = torch.linspace(-2, 2, 60, device=device).unsqueeze(0).unsqueeze(-1)  # [1, 60, 1]
+
+    net_fn = lambda t, yt, xx, m, *, key: (
+        model(  # BiDimensionalAttentionModel
+            xx.unsqueeze(0),  # [N,D] ➜ [1,N,D]
+            yt.unsqueeze(0),  # [N,1] ➜ [1,N,1]
+            t.view(1),  # []    ➜ [1]
+            m.unsqueeze(0) if m is not None else m
+        ).squeeze(0)  # back to [N,1] for the diffusion code
+    )
+
+    gen = torch.Generator(device=device).manual_seed(0)
+    ys = torch.stack([process.sample(gen, x, None, model_fn=net_fn) for _ in range(8)]
+                     ).squeeze(-1)  # [8,N]
+
+    plt.figure(figsize=(4, 3))
+    plt.plot(x.cpu(), ys.cpu().T, color="C0", alpha=0.5)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_dir / f"{title}.png", dpi=200)
+    plt.close()
+
+# ------------------------------------------------------------------ #
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cfg_file", default=None)
+    cfg = Config() if (ns := parser.parse_args()).cfg_file is None \
+        else Config.from_file(ns.cfg_file)
+
+    pprint.pprint(asdict(cfg))
+    train(cfg)
+
+
+
+if __name__ == "__main__":
+    main()

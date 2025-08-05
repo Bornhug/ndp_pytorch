@@ -74,7 +74,7 @@ class GaussianDiffusion:
         Closed-form p(y_t | y_0) moments.
         Returns (mean, var) each of shape [N, y_dim].
         """
-        ᾱ_t = _expand_to(self.alpha_bars[t], y0)
+        ᾱ_t = self.alpha_bars[t].to(y0.device)  # ⬅️ ensure ᾱ_t is on the same device as y0
         m    = torch.sqrt(ᾱ_t) * y0
         v    = (1.0 - ᾱ_t)
         return m, v   # [N, y_dim]
@@ -90,7 +90,9 @@ class GaussianDiffusion:
             y_t = √ᾱ_t y0 + √(1-ᾱ_t) ε
         """
         m, v   = self.pt0(y0, t)
-        noise  = torch.randn_like(y0, generator=key) # We can't use a single scalar noise as noises have to be iid
+        noise = torch.randn(y0.shape, dtype=y0.dtype, device=y0.device
+                            #, generator=key
+                            )
         yt     = m + torch.sqrt(v) * noise
         return yt, noise # [N, y_dim]
 
@@ -108,9 +110,9 @@ class GaussianDiffusion:
         α_t      = _expand_to(self.alphas[t], yt)
         ᾱ_t     = _expand_to(self.alpha_bars[t], yt)
 
-        z = torch.zeros_like(yt)  # when t=0, we don't add Gaussian noise
-        if t.item() > 0:                           # no noise at t=0
-            z = torch.randn_like(yt, generator=key)
+        z = torch.zeros_like(yt)
+        if t.item() > 0:
+            z = torch.randn(yt.shape, dtype=yt.dtype, device=yt.device, generator=key)
 
         a = 1.0 / torch.sqrt(α_t)
         b = β_t / torch.sqrt(1.0 - ᾱ_t)
@@ -250,57 +252,102 @@ class GaussianDiffusion:
 
 
 # ---------- training loss --------------------------------------------------
-def diffusion_loss(process: GaussianDiffusion,
-                   network: EpsModel,
-                   batch,                       # Batch object with .x_target …
-                   key: torch.Generator,
-                   *,
-                   num_timesteps: int,
-                   loss_type: str = "l1") -> torch.Tensor:
-    """
-    Monte-Carlo estimate of E_t |ε – ε̂| or E_t (ε – ε̂)²   (per DDPM paper).
-    """
+# def loss(process: GaussianDiffusion,
+#                    network: EpsModel,
+#                    batch,                       # Batch object with .x_target …
+#                    key: torch.Generator,
+#                    *,
+#                    num_timesteps: int,
+#                    loss_type: str = "l1") -> torch.Tensor:
+#     """
+#     Monte-Carlo estimate of E_t |ε – ε̂| or E_t (ε – ε̂)²   (per DDPM paper).
+#     """
+#
+#     metric = (lambda a, b: (a - b).abs()) if loss_type == "l1" \
+#              else (lambda a, b: (a - b) ** 2) #l2 loss
+#
+#     def single_point_loss(k: torch.Generator,
+#                           t: int,
+#                           y: torch.Tensor, # [N, y_dim]
+#                           x: torch.Tensor, # [N, x_dim]
+#                           mask: torch.Tensor):
+#         t_tensor = torch.tensor(t, dtype=torch.long, device=y.device)
+#         yt, noise = process.forward(k, y, t_tensor)
+#
+#         noise_hat = network(torch.tensor(t, device=y.device),
+#                             yt, x, mask, key=k)
+#         per_point = metric(noise, noise_hat).sum(-1)      # [N]
+#         per_point = per_point * (1.0 - mask)              # ignore masked
+#         denom = len(mask) - mask.sum()
+#         # len(mask) == N , mask.sum() == inactive points, so denom == active points
+#         return per_point.sum() / denom
+#
+#     B = batch.x_target.size(0)
+#
+#     # (i) Strided low-discrepancy draw of t  ∈ {0…T-1}
+#     g_t = torch.Generator(device=process.device)
+#     g_t.manual_seed(torch.randint(0, 2**63-1, (1,)).item())
+#     t0 = torch.randint(0, num_timesteps // B, (B,), generator=g_t,
+#                        device=process.device)
+#     t  = t0 + torch.arange(B, device=process.device) * (num_timesteps // B)
+#
+#     # (ii) Default “all points valid” mask
+#     mask_target = (torch.zeros_like(batch.x_target[..., 0])  # [B,N]
+#                    if batch.mask_target is None else batch.mask_target)
+#
+#     # (iii) vmap via list comprehension (Python loop fine for small B)
+#     losses = []
+#     for bi in range(B):
+#         g = torch.Generator()
+#         g.manual_seed(torch.randint(0, 2**63-1, (1,)).item())
+#         losses.append(single_point_loss(
+#             g, int(t[bi].item()),
+#             batch.y_target[bi], # [N, y_dim]
+#             batch.x_target[bi], # [N, x_dim]
+#             mask_target[bi])    # [N]
+#         )
+#
+#     return torch.stack(losses, 0).mean()
+
+def loss(process: GaussianDiffusion,
+         network: EpsModel,
+         batch,
+         key: torch.Generator,
+         *,
+         num_timesteps: int,
+         loss_type: str = "l1") -> torch.Tensor:
 
     metric = (lambda a, b: (a - b).abs()) if loss_type == "l1" \
-             else (lambda a, b: (a - b) ** 2) #l2 loss
+             else (lambda a, b: (a - b) ** 2)
 
-    def single_point_loss(k: torch.Generator,
-                          t: int,
-                          y: torch.Tensor, # [N, y_dim]
-                          x: torch.Tensor, # [N, x_dim]
-                          mask: torch.Tensor):
-        yt, noise = process.forward(k, y, torch.tensor(t, device=y.device))
-        noise_hat = network(torch.tensor(t, device=y.device),
-                            yt, x, mask, key=k)
-        per_point = metric(noise, noise_hat).sum(-1)      # [N]
-        per_point = per_point * (1.0 - mask)              # ignore masked
-        denom = len(mask) - mask.sum()
-        # len(mask) == N , mask.sum() == inactive points, so denom == active points
-        return per_point.sum() / denom
+    # B = batch size, N = # of target points
+    B, N, y_dim = batch.y_target.shape
 
-    B = batch.x_target.size(0)
+    device = batch.y_target.device
+    t = torch.randint(0, num_timesteps, (B,), generator=key, device=device)  # [B]
 
-    # (i) Strided low-discrepancy draw of t  ∈ {0…T-1}
-    g_t = torch.Generator(device=process.device)
-    g_t.manual_seed(torch.randint(0, 2**63-1, (1,)).item())
-    t0 = torch.randint(0, num_timesteps // B, (B,), generator=g_t,
-                       device=process.device)
-    t  = t0 + torch.arange(B, device=process.device) * (num_timesteps // B)
+    # Expand for batched computation
+    t_ = t.view(B, 1, 1)                              # [B,1,1]
+    ᾱ_t = process.alpha_bars[t_].to(device)          # [B,1,1]
+    yt = torch.sqrt(ᾱ_t) * batch.y_target + \
+         torch.sqrt(1. - ᾱ_t) * torch.randn_like(batch.y_target)  # [B,N,1]
 
-    # (ii) Default “all points valid” mask
-    mask_target = (torch.zeros_like(batch.x_target[..., 0])  # [B,N]
-                   if batch.mask_target is None else batch.mask_target)
+    # Run model
+    noise_hat = network(
+        t.to(dtype=torch.float32),
+        yt,
+        batch.x_target,
+        batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device),
+        key=key
+    )
+    noise_true = (yt - torch.sqrt(ᾱ_t) * batch.y_target) / torch.sqrt(1. - ᾱ_t)
 
-    # (iii) vmap via list comprehension (Python loop fine for small B)
-    losses = []
-    for bi in range(B):
-        g = torch.Generator()
-        g.manual_seed(torch.randint(0, 2**63-1, (1,)).item())
-        losses.append(single_point_loss(
-            g, int(t[bi].item()),
-            batch.y_target[bi], # [N, y_dim]
-            batch.x_target[bi], # [N, x_dim]
-            mask_target[bi])    # [N]
-        )
+    # Per-point loss
+    loss_per = metric(noise_true, noise_hat).sum(-1)  # [B,N]
 
-    return torch.tensor(losses, device=process.device).mean()
+    mask_target = batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device)
+    mask = 1.0 - mask_target
+
+    loss_per = loss_per * mask                        # [B,N]
+
+    return loss_per.sum() / mask.sum()
