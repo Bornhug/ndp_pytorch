@@ -42,9 +42,9 @@ class Config:
     dataset: str = "se"
     input_dim: int = 1
     batch_size: int = 32
-    num_epochs: int = 250
+    num_epochs: int = 10
     samples_per_epoch: int = int(2**14)
-    loss_type: str = "l1"
+    loss_type: str = "l2"
     eval: EvalConfig = EvalConfig()
     network: NetworkConfig = NetworkConfig()
     schedule: DiffusionConfig = DiffusionConfig()

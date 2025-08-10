@@ -37,7 +37,7 @@ def cosine_schedule(beta_start: float,
 
 
 # ---------- protocol for the ε-network -------------------------------------
-class EpsModel(Protocol):
+class EpsModel(Protocol):  # Bidimentional model
     def __call__(self,
                  t: torch.Tensor,        # scalar int64        []
                  yt: torch.Tensor,       # noisy targets       [N, y_dim]
@@ -230,7 +230,11 @@ class GaussianDiffusion:
 
                 # (3) *forward* step t‑1 → t **only for targets**
                 beta_tm1 = _expand_to(self.betas[t-1], y_t)
-                z        = torch.randn_like(y_t, generator=g_fwd)
+                try:
+                    z = torch.randn_like(y_t, generator=g_fwd)
+                except TypeError:  # older PyTorch – fall-back
+                    z = torch.randn(y_t.shape, dtype=y_t.dtype,
+                                    device=y_t.device, generator=g_fwd)
                 y_t      = torch.sqrt(1.0 - beta_tm1) * y_t + torch.sqrt(beta_tm1) * z
 
             # ---------- final reverse step of outer loop  (t → t‑1)

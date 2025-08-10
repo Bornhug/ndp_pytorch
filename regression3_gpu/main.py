@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse, datetime, math, pprint, random, string
+import os
 from dataclasses import asdict
 from pathlib import Path
 from functools import partial
@@ -40,7 +41,6 @@ class InfiniteDataset(IterableDataset):
     def __init__(self, cfg: Config, train: bool):
         self.cfg, self.train = cfg, train
         #self.gen = torch.Generator().manual_seed(cfg.seed)
-
     def __iter__(self):
         while True:
             gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
@@ -74,7 +74,7 @@ def _ema_update(ema: nn.Module, online: nn.Module, decay: float):
 
 def make_loss_fn(process: GaussianDiffusion, cfg: Config):
     def _loss_fn(
-        model: torch.nn.Module,
+        model: torch.nn.Module, # BidimentionalAttentionModel
         batch: Batch,
         key: torch.Generator,          # positional, not a kwarg
     ) -> torch.Tensor:
@@ -114,12 +114,12 @@ def train(cfg: Config):
 
     model     = build_network(cfg).to(device)
     model_ema = build_network(cfg).to(device)
-    model_ema.load_state_dict(model.state_dict())
+    model_ema.load_state_dict(model.state_dict()) # make the initial paras of model_ema identical to model
     process   = build_process(cfg)
     loss_fn   = make_loss_fn(process, cfg)
 
     # ---- optimiser & LR schedule (warm-up + cosine) ---------------------
-    opt = AdamW(model.parameters(),
+    optimiser = AdamW(model.parameters(),
                 lr=cfg.optimizer.peak_lr,
                 betas=(0.9, 0.999))                # weight_decay left at default 0
 
@@ -132,7 +132,7 @@ def train(cfg: Config):
         prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1 + math.cos(math.pi * prog))
 
-    sched = LambdaLR(opt, lr_lambda)
+    lr_sched = LambdaLR(optimiser, lr_lambda)
 
     device = _device()  # already cuda:0
     gen = torch.Generator(device=device).manual_seed(cfg.seed)
@@ -143,19 +143,22 @@ def train(cfg: Config):
 
     for step, batch in zip(pbar, data):
         batch = Batch(**{k: v.to(device, non_blocking=True) for k, v in batch.__dict__.items()})
+        # if step == 1:
+        #     debug_batch(batch, dataset_name=cfg.dataset, active_dims=list(range(cfg.input_dim)),
+        #                 title=f"Step_{step}_input_data")
 
-        opt.zero_grad(set_to_none=True)
+        optimiser.zero_grad(set_to_none=True)
         loss = loss_fn(model, batch, gen)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step(); sched.step()
+        optimiser.step(); lr_sched.step()
 
         _ema_update(model_ema, model, cfg.optimizer.ema_rate)
 
         if step % 100 == 0 or step == 1:
-            pbar.set_description(f"loss {loss.item():.3f} • lr {sched.get_last_lr()[0]:.2e}")
+            pbar.set_description(f"loss {loss.item():.3f} • lr {lr_sched.get_last_lr()[0]:.2e}")
 
-        if step % (total_steps // 8) == 0:
+        if step == 1 or step % (total_steps // 4) == 0:
             _plot_samples(model_ema, process, cfg, device,
                           title=f"step_{step:07d}",
                           out_dir=log_dir / "plots")
@@ -210,3 +213,65 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# def plot_gp_batch(batch, title="Step 1 GP samples"):
+#     import matplotlib.pyplot as plt
+#
+#     x_t = batch.x_target.detach().cpu()   # [B, N, 1]
+#     y_t = batch.y_target.detach().cpu()   # [B, N, 1]
+#     B, N, _ = x_t.shape
+#
+#     plt.figure(figsize=(6,4))
+#     for i in range(min(8, B)):
+#         x = x_t[i, :, 0]
+#         y = y_t[i, :, 0]
+#         idx = torch.argsort(x)            # sort indices by x
+#         plt.plot(x[idx], y[idx], alpha=0.7)
+#     plt.xlabel("x"); plt.ylabel("y"); plt.title(title)
+#     plt.tight_layout();
+#     plt.savefig(f"test_gp.png", dpi=200)
+#     plt.close()
+#     print(f"Saved test_gp.png")
+#
+#
+# def print_tensor_stats(name, value):
+#     if value.numel() == 0:
+#         print(f"  ⚠ {name} is empty: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}")
+#         return
+#
+#     print(f"  🔹 {name}: {{"
+#           f"'shape': {tuple(value.shape)}, "
+#           f"'dtype': '{value.dtype}', "
+#           f"'device': '{value.device}', "
+#           f"'mean': {value.float().mean().item():.6f}, "
+#           f"'var': {value.float().var(unbiased=False).item():.6f}, "
+#           f"'min': {value.min().item():.6f}, "
+#           f"'max': {value.max().item():.6f}}}")
+#
+# def debug_batch(batch, dataset_name=None, active_dims=None, title="Batch Debug Plot", out_dir="debug_plots"):
+#     import os
+#     import matplotlib.pyplot as plt
+#     os.makedirs(out_dir, exist_ok=True)
+#
+#     # Tensor stats
+#     for k, v in batch.__dict__.items():
+#         print_tensor_stats(k, v)
+#
+#     # Plot if 1D input
+#     if batch.x_context.shape[-1] == 1 and batch.x_target.shape[-1] == 1:
+#         if batch.x_context.numel() > 0 and batch.y_context.numel() > 0:
+#             plt.scatter(batch.x_context.cpu(), batch.y_context.cpu(), color='blue', label="Context", s=20)
+#         if batch.x_target.numel() > 0 and batch.y_target.numel() > 0:
+#             plt.scatter(batch.x_target.cpu(), batch.y_target.cpu(), color='red', label="Target", s=20, alpha=0.6)
+#
+#         plt.title(title)
+#         plt.legend()
+#         plt.tight_layout()
+#         file_path = os.path.join(out_dir, f"{title.replace(' ', '_')}.png")
+#         plt.savefig(file_path, dpi=150)
+#         plt.close()
+#         print(f"Saved plot to {file_path}")
+#
+#     plot_gp_batch(batch)
+
+

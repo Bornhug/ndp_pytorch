@@ -19,6 +19,8 @@ import math
 import torch
 from torch import Tensor
 import numpy as np
+import inspect
+
 
 __all__ = [
     "DATASETS",
@@ -31,6 +33,7 @@ __all__ = [
 # ------------------------------------------------------------------
 #  Compatibility helper – honours Generator on all PyTorch builds
 # ------------------------------------------------------------------
+
 def _randn_like(x: torch.Tensor, g: torch.Generator) -> torch.Tensor:
     """Draw N(0,1) with the same shape/device/dtype as `x`, using `g`."""
     try:                                 # preferred path (newer wheels)
@@ -40,35 +43,47 @@ def _randn_like(x: torch.Tensor, g: torch.Generator) -> torch.Tensor:
             x.shape, dtype=x.dtype, device=x.device, generator=g
         )
 
+def _rand_like(x: torch.Tensor, g: torch.Generator) -> torch.Tensor:
+    """Draw Uniform(0,1) with the same shape/device/dtype as `x`, using `g`."""
+    try:                                 # preferred path (newer wheels)
+        return torch.rand_like(x, generator=g)
+    except TypeError:                    # fallback (e.g. Win + 2.3.0)
+        return torch.rand(
+            x.shape, dtype=x.dtype, device=x.device, generator=g
+        )
 
 # -----------------------------------------------------------------------------
 #                           Helper distributions
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+#                         Functional distribution base
+# -----------------------------------------------------------------------------
+
+
 
 @dataclass
 class UniformDiscrete:
-    """Inclusive discrete uniform distribution ``[lower, upper]``."""
+    """Inclusive discrete uniform distribution ``[low, high]``."""
+    low: int
+    high: int
 
-    lower: int
-    upper: int
+    def sample(self, shape: Tuple[int, ...], *, g: torch.Generator) -> Tensor:
+        if self.low == self.high:
+            return torch.full(shape, self.low, dtype=torch.int32)
+        return torch.randint(self.low, self.high + 1, shape, generator=g)
 
-    def sample(self, g: torch.Generator, shape: Tuple[int, ...]) -> Tensor:
-        if self.lower == self.upper:
-            return torch.full(shape, self.lower, dtype=torch.int32)
-        return torch.randint(self.lower, self.upper + 1, shape, generator=g)
-
-
+@dataclass
 class _Uniform:
     """Continuous uniform helper (works irrespective of PyTorch version)."""
-
-    def __init__(self, low: float, high: float):
-        self.low, self.high = float(low), float(high)
+    low: float
+    high: float
 
     def sample(
-        self, *, generator: torch.Generator, sample_shape: Tuple[int, ...]
+        self,  sample_shape: Tuple[int, ...], *, generator: torch.Generator,
     ) -> Tensor:
         # Explicit sampling because torch.distributions.Uniform.sample(*, generator)
         # is only available in recent PyTorch versions.
+        # The *sample_shape unpacks the tuple into separate positional arguments.
         return self.low + (self.high - self.low) * torch.rand(*sample_shape, generator=generator)
 
 
@@ -114,21 +129,22 @@ _TASK_CONFIGS: Dict[str, TaskConfig] = {
     "interpolation": TaskConfig(_Uniform(-2.0, 2.0), _Uniform(-2.0, 2.0)),
 }
 
-# -----------------------------------------------------------------------------
-#                         Functional distribution base
-# -----------------------------------------------------------------------------
 
-class FunctionalDistribution:
-    """Base class – each dataset must implement ``sample``."""
-
-    def sample(self, g: torch.Generator, x: Tensor) -> Tensor:  # (N, D) -> (N, 1)
-        raise NotImplementedError
 
 
 # =========== Gaussian‑process helpers ===========
+class FunctionalDistribution:
+    """Base class – each dataset must implement ``sample``."""
+
+    def sample(self,  x: Tensor, g: torch.Generator) -> Tensor:  # (N, D) -> (N, 1)
+        raise NotImplementedError
+
 
 def _rbf_kernel(x1: Tensor, x2: Tensor, lengthscale: float, variance: float) -> Tensor:
     diff = x1[:, None, :] - x2[None, :, :]
+    # (N1, 1, D) and (1, N2, D)
+    # → broadcast
+    # to(N1, N2, D).
     sqdist = (diff ** 2).sum(-1)
     return variance * torch.exp(-0.5 * sqdist / (lengthscale ** 2))
 
@@ -139,8 +155,6 @@ def _matern52_kernel(x1: Tensor, x2: Tensor, lengthscale: float, variance: float
     r = diff / lengthscale
     return variance * (1 + sqrt5 * r + 5.0 / 3.0 * r ** 2) * torch.exp(-sqrt5 * r)
 
-
-import inspect
 
 class GPFunctionalDistribution(FunctionalDistribution):
     """Gaussian-process sampler that works on every PyTorch version."""
@@ -160,19 +174,12 @@ class GPFunctionalDistribution(FunctionalDistribution):
         L = torch.linalg.cholesky(mvn.covariance_matrix)  # (N, N)
 
         # --- inside GPFunctionalDistribution._rsample ---------------------
-        try:
-            z = torch.randn_like(mvn.mean, generator=g)
-        except TypeError:
-            z = torch.randn(
-                mvn.mean.shape, dtype=mvn.mean.dtype, device=mvn.mean.device, generator=g
-            )
+        z = _randn_like(mvn.mean, g=g)
 
-        #  (replace the block above with)  z = _randn_like(mvn.mean, g)
-
-        return mvn.mean + L @ z
+        return mvn.mean + L @ z # x=μ+Lz ∼ N(μ,Σ)
 
     # -------- public API -----------------------------------------------------
-    def sample(self, g: torch.Generator, x: Tensor) -> Tensor:
+    def sample(self,  x: Tensor, g: torch.Generator) -> Tensor:
         n = x.size(0)
         K = self.kernel_fn(x, x) + _JITTER * torch.eye(n, device=x.device, dtype=x.dtype)
         mvn = torch.distributions.MultivariateNormal(
@@ -201,10 +208,16 @@ def register_dataset_factory(name: str):
 
     return decorator
 
-
+# When you write @register_dataset_factory("se") above a function f, Python will:
+# Call register_dataset_factory("se"), which returns decorator.
+# Call decorator(f), which:
+# Registers f into _DATASET_FACTORIES under the key "se".
+# Returns f unchanged (so you can still call it directly if you want).
+# This is a clean way to declare and register dataset builders right where they’re defined, without separately editing the registry.
 @register_dataset_factory("se")
-def _se_dataset_factory(active_dims: List[int]):
+def _se_dataset_factory(active_dims: List[int]): # Sometimes you train a model on 3-D inputs x = (x₀, x₁, x₂) but want the target function to be 1-D: f(x) = g(x₀) (ignore x₁, x₂).
     factor = math.sqrt(len(active_dims))
+    # It computes factor = √D where D = len(active_dims)
 
     def k(a: Tensor, b: Tensor):
         return _rbf_kernel(a[:, active_dims], b[:, active_dims], _LENGTHSCALE * factor, _KERNEL_VAR)
@@ -215,6 +228,7 @@ def _se_dataset_factory(active_dims: List[int]):
 @register_dataset_factory("matern")
 def _matern_dataset_factory(active_dims: List[int]):
     factor = math.sqrt(len(active_dims))
+    # In D dimensions(active dims),  the typical distance between two points grows like sqrt(D)
 
     def k(a: Tensor, b: Tensor):
         return _matern52_kernel(a[:, active_dims], b[:, active_dims], _LENGTHSCALE * factor, _KERNEL_VAR)
@@ -280,10 +294,10 @@ def get_batch(
     g: torch.Generator,
     *,
     batch_size: int,
-    name: str,
-    task: str,
+    name: str, # e.g. "se"
+    task: str, # e.g. "training"
     input_dim: int,
-    device: torch.device | str | None = None,
+    device: torch.device | str | None = None
 ) -> Batch:
     if name not in DATASETS:
         raise ValueError(f"Unknown dataset: {name}")
@@ -296,18 +310,20 @@ def get_batch(
 
     # Numbers of points --------------------------------------------------------
     if task == "training":
-        n_target = cfg.eval_num_target.sample(g, (1,)).item()
+        n_target = cfg.eval_num_target.sample( (1,), g=g).item() # Should be 50 here
         n_context = 0
-    else:  # interpolation
-        n_target = cfg.eval_num_target.upper
-        n_context = cfg.eval_num_context.sample(g, (1,)).item()
+    elif task == "interpolation":
+        n_target = cfg.eval_num_target.high # Should be 50 here
+        n_context = cfg.eval_num_context.sample( (1,), g=g).item() # Should be 1 to 10
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
     # Inputs -------------------------------------------------------------------
     x_context = _TASK_CONFIGS[task].x_context_dist.sample(
-        generator=g, sample_shape=(batch_size, n_context, input_dim)
+        sample_shape=(batch_size, n_context, input_dim), generator=g
     )
     x_target = _TASK_CONFIGS[task].x_target_dist.sample(
-        generator=g, sample_shape=(batch_size, n_target, input_dim)
+        sample_shape=(batch_size, n_target, input_dim), generator=g
     )
     x_all = torch.cat([x_context, x_target], dim=1)
 
@@ -317,8 +333,10 @@ def get_batch(
 
     # Outputs ------------------------------------------------------------------
     active_dims = list(range(input_dim))
-    sample_fn = _DATASET_FACTORIES[name](active_dims).sample
-    y_all = torch.stack([sample_fn(g, x_all[b]) for b in range(batch_size)], dim=0)
+    dataset_factory = _DATASET_FACTORIES[name] # A function
+    function_distribution = dataset_factory(active_dims) # Normally GP
+    sample_fn = function_distribution.sample
+    y_all = torch.stack([sample_fn(x_all[b], g) for b in range(batch_size)], dim=0)
     y_context, y_target = y_all[:, :n_context], y_all[:, n_context:]
 
     if device is not None:
