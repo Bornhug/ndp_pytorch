@@ -117,7 +117,7 @@ class GaussianDiffusion:
         a = 1.0 / torch.sqrt(α_t)
         b = β_t / torch.sqrt(1.0 - ᾱ_t)
         mean = a * (yt - b * noise)
-        return mean + torch.sqrt(β_t) * z
+        return mean + torch.sqrt(β_t) * z  #TODO: variance might be wrong
 
     # TODO: check again, seems ddpm_backward_mean_var is never used
     # ---------------------------------------------- mean / var diagnostics
@@ -203,7 +203,7 @@ class GaussianDiffusion:
         # ---- concatenate arrays for one network call ----------------------
         x_aug    = torch.cat([x_context, x], dim=0)          # [(M+N), x_dim]
         mask_aug = torch.cat([mask_context, mask], dim=0)    # [(M+N)]
-        M_ctx    = len(x_context)
+        num_ctx    = len(x_context)
 
         # ---- initial noisy target at time T -------------------------------
         y_t = torch.randn(B_tgt, y_dim, device=device, dtype=dtype, generator=key)
@@ -226,10 +226,10 @@ class GaussianDiffusion:
 
                 eps_hat = model_fn(t_tensor, y_aug, x_aug, mask_aug, key=g_model)
                 y_prev  = self.ddpm_backward_step(g_rev, eps_hat, y_aug, t_tensor)  # [(M+N), y_dim]
-                y_t     = y_prev[M_ctx:]                                           # keep only targets
+                y_t     = y_prev[num_ctx:]                                           # keep only targets
 
                 # (3) *forward* step t‑1 → t **only for targets**
-                beta_tm1 = _expand_to(self.betas[t-1], y_t)
+                beta_tm1 = _expand_to(self.betas[t-1], y_t) # TODO: We should use beta_t for one step forward
                 try:
                     z = torch.randn_like(y_t, generator=g_fwd)
                 except TypeError:  # older PyTorch – fall-back
@@ -248,7 +248,7 @@ class GaussianDiffusion:
 
             eps_hat = model_fn(t_tensor, y_aug, x_aug, mask_aug, key=g_model)
             y_prev  = self.ddpm_backward_step(g_rev, eps_hat, y_aug, t_tensor)
-            y_t     = y_prev[M_ctx:]                    # drop context portion
+            y_t     = y_prev[num_ctx:]                    # drop context portion
 
         # after the loop y_t is at time 0 → final sample
         return y_t

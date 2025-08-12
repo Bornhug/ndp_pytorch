@@ -1,7 +1,14 @@
 # ---------------------------------------------------------------------
 # main_torch.py – PyTorch training loop for Neural Diffusion Processes
 # ---------------------------------------------------------------------
+# make imports work when run directly
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]  # project root …/ndp_pytorch
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import argparse, datetime, math, pprint, random, string
 import os
@@ -23,6 +30,9 @@ from neural_diffusion_processes.types import Batch
 from data import get_batch
 from config import Config
 
+from torch.utils.tensorboard import SummaryWriter
+import json
+
 # ------------------------------------------------------------------ #
 #  Helpers                                                           #
 # ------------------------------------------------------------------ #
@@ -42,10 +52,14 @@ class InfiniteDataset(IterableDataset):
         self.cfg, self.train = cfg, train
         #self.gen = torch.Generator().manual_seed(cfg.seed)
     def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        # Give each worker a distinct, persistent generator
+        base_seed = self.cfg.seed + (info.id if info else 0)
+        g = torch.Generator().manual_seed(base_seed)
         while True:
-            gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
+            #gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
             yield get_batch(
-                gen,                                   # positional
+                g,                                   # positional
                 batch_size=self.cfg.batch_size,
                 name=self.cfg.dataset,
                 task="training" if self.train else "interpolation",
@@ -104,6 +118,16 @@ def train(cfg: Config):
     log_dir.mkdir(parents=True, exist_ok=True)
     print("Logging to:", log_dir)
 
+
+    # ── TensorBoard writer ─────────────────────────────────────────────
+    tb_dir = log_dir / "tb"
+    writer = SummaryWriter(tb_dir.as_posix())
+    try:
+        writer.add_text("config/json", f"```json\n{json.dumps(asdict(cfg), indent=2)}\n```", global_step=0)
+    except Exception:
+        writer.add_text("config/str", str(asdict(cfg)), global_step=0)
+    # ───────────────────────────────────────────────────────────────────
+
     data = DataLoader(
         InfiniteDataset(cfg, train=True),
         batch_size=None,
@@ -123,7 +147,7 @@ def train(cfg: Config):
                 lr=cfg.optimizer.peak_lr,
                 betas=(0.9, 0.999))                # weight_decay left at default 0
 
-    warmup_steps = cfg.steps_per_epoch * cfg.optimizer.num_warmup_epochs
+    warmup_steps = 0.05 * cfg.steps_per_epoch * cfg.optimizer.num_warmup_epochs
     total_steps  = cfg.total_steps
 
     def lr_lambda(step: int):
@@ -150,18 +174,26 @@ def train(cfg: Config):
         optimiser.zero_grad(set_to_none=True)
         loss = loss_fn(model, batch, gen)
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # clip returns total grad norm — log it
+        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimiser.step(); lr_sched.step()
 
         _ema_update(model_ema, model, cfg.optimizer.ema_rate)
 
+        # ── TensorBoard scalars ────────────────────────────────────────
+        writer.add_scalar("train/loss", float(loss.item()), step)
+        writer.add_scalar("train/lr", lr_sched.get_last_lr()[0], step)
+        writer.add_scalar("train/grad_norm", grad_norm, step)
+        # ───────────────────────────────────────────────────────────────
+
         if step % 100 == 0 or step == 1:
             pbar.set_description(f"loss {loss.item():.3f} • lr {lr_sched.get_last_lr()[0]:.2e}")
 
-        if step == 1 or step % (total_steps // 4) == 0:
+        if step == 1 or step % (total_steps // 8) == 0: # TODO: 4 set the num of plots
             _plot_samples(model_ema, process, cfg, device,
                           title=f"step_{step:07d}",
-                          out_dir=log_dir / "plots")
+                          out_dir=log_dir / "plots",
+                          writer=writer, step=step)
 
         if step >= total_steps:
             break
@@ -171,7 +203,7 @@ def train(cfg: Config):
 
 # ------------------------------------------------------------------ #
 @torch.no_grad()
-def _plot_samples(model, process, cfg, device, title, out_dir: Path):
+def _plot_samples(model, process, cfg, device, title, out_dir: Path, writer: SummaryWriter | None = None, step: int | None = None):
     if cfg.input_dim != 1:
         return
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -192,11 +224,16 @@ def _plot_samples(model, process, cfg, device, title, out_dir: Path):
     ys = torch.stack([process.sample(gen, x, None, model_fn=net_fn) for _ in range(8)]
                      ).squeeze(-1)  # [8,N]
 
-    plt.figure(figsize=(4, 3))
+    fig = plt.figure(figsize=(4, 3))
     plt.plot(x.cpu(), ys.cpu().T, color="C0", alpha=0.5)
     plt.title(title)
     plt.tight_layout()
     plt.savefig(out_dir / f"{title}.png", dpi=200)
+
+    # Log to TensorBoard
+    if writer is not None and step is not None:
+        writer.add_figure("samples/unconditional_grid", fig, global_step=step)
+
     plt.close()
 
 # ------------------------------------------------------------------ #

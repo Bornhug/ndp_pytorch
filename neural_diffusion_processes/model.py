@@ -82,6 +82,10 @@ class MultiHeadAttention(nn.Module):
         # q, k, v : [..., num_heads, seq_len, depth]
 
         if mask is not None:
+            if mask.dim() == 1:  # [N] -> [1,N]
+                mask = mask.unsqueeze(0)
+            if mask.dim() == 2:  # [B,N] -> [B,1,N] (will later broadcast over D)
+                mask = mask.unsqueeze(1)
             mask_seq_q = mask[..., :, None]   # (..., S, 1)
             mask_seq_v = mask[..., None, :]   # (..., 1, S)
             mask = mask_seq_q + mask_seq_v    # broadcast to (..., S, S)
