@@ -32,7 +32,7 @@ DEFAULT_MODE      = "uncond"   # "uncond" or "cond"
 DEFAULT_N_POINTS  = 50        # number of x points to sample on
 DEFAULT_N_FUNCS   = 8          # curves for unconditional mode
 DEFAULT_SEED      = 0
-DEFAULT_OUT       = Path("samples") / "out.png"
+DEFAULT_OUT       = Path("samples") / "out_euler_steps25.png"
 DEFAULT_LOG_ROOT  = Path("logs") / "regression"   # where runs live
 
 
@@ -292,7 +292,7 @@ def main(
     process = build_process(cfg, device)
 
     t0 = time.time()
-    plot_exact_like_training(model, process, cfg, device, "samples/like_training.png")
+    #plot_exact_like_training(model, process, cfg, device, "samples/like_training.png")
     print(f"[timing] plot_exact_like_training took {time.time() - t0:.2f} sec")
 
     # Unconditional
@@ -340,16 +340,18 @@ def main(
 
 
 if __name__ == "__main__":
-    ckpt_file = Path("logs/regression_npz/Aug11_015205_lckk/model_ema.pt")
+    ckpt_file = Path("logs/regression/Aug11_161904_blgf/model_ema.pt")
+    sampler = "ddim"
+    num_steps = 25
     main(
         ckpt=ckpt_file,
         mode="cond",          # or "uncond"
         n_points=50,
         n_funcs=8,
         seed=0,
-        sampler="heun",       # "ddpm" | "ddim" | "euler" | "heun"
-        num_steps=25,         # (used by ddim/euler/heun)
+        sampler=sampler,       # "ddpm" | "ddim" | "euler" | "heun"
+        num_steps=num_steps,         # (used by ddim/euler/heun)
         K=14,
-        out_path=Path("samples/out.png"),
+        out_path=Path(f"logs/regression/Aug11_161904_blgf/out_{sampler}_steps{num_steps}.png"),
     )
 
