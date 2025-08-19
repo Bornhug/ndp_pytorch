@@ -20,7 +20,6 @@ class OptimizerConfig:
     end_lr: float = 1e-5
     ema_rate: float = 0.995  # 0.999
     weight_decay: float = 0.0        # ← NEW (AdamW regularisation)
-    ema_rate: float = 0.995          # 0.999
 
 @dataclass
 class NetworkConfig:
@@ -32,19 +31,19 @@ class NetworkConfig:
 @dataclass
 class EvalConfig:
     batch_size: int = 4
-    num_samples: int = 128
+    num_samples: int = 8
     float64: bool = False
 
 
 @dataclass
 class Config:
     seed: int = 42
-    dataset: str = "se"
+    dataset: str = "matern"
     input_dim: int = 1
     batch_size: int = 32
-    num_epochs: int = 10
+    num_epochs: int = 250
     samples_per_epoch: int = int(2**14)
-    loss_type: str = "l2"
+    loss_type: str = "l1"
     eval: EvalConfig = EvalConfig()
     network: NetworkConfig = NetworkConfig()
     schedule: DiffusionConfig = DiffusionConfig()
