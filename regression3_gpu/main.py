@@ -55,6 +55,7 @@ class InfiniteDataset(IterableDataset):
         info = torch.utils.data.get_worker_info()
         # Give each worker a distinct, persistent generator
         base_seed = self.cfg.seed + (info.id if info else 0)
+        print(base_seed)
         g = torch.Generator().manual_seed(base_seed)
         while True:
             #gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
