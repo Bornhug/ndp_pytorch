@@ -29,8 +29,10 @@ DEFAULT_MODE      = "uncond"   # "uncond" or "cond"
 DEFAULT_N_POINTS  = 50        # number of x points to sample on
 DEFAULT_N_FUNCS   = 8          # curves for unconditional mode
 DEFAULT_SEED      = 0
-DEFAULT_OUT       = Path("samples") / "out.png"
+DEFAULT_OUT       = Path("samples") / "out_euler_steps25.png"
 DEFAULT_LOG_ROOT  = Path("logs") / "regression"   # where runs live
+
+
 # ==================================================================
 
 
@@ -268,5 +270,5 @@ if __name__ == "__main__":
         n_points=50,
         n_funcs=8,
         seed=0,
-        out_path=Path("samples/out.png")
+        out_path=Path("logs/regression/Aug11_161904_blgf/out_euler_steps25.png")
     )
