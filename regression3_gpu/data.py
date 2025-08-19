@@ -91,9 +91,7 @@ class _Uniform:
 #                               Public constants
 # -----------------------------------------------------------------------------
 
-# 2) Ensure DATASETS contains "matern_ln" (add to the existing list):
-# DATASETS = ["se", "matern", "matern_ln", "sawtooth", "step"]
-DATASETS = ["se", "matern", "sawtooth", "step", "matern_ln"]
+DATASETS = ["se", "matern", "sawtooth", "step"]
 TASKS = ["training", "interpolation"]
 
 # -----------------------------------------------------------------------------
@@ -119,15 +117,9 @@ _KERNEL_VAR = 1.0
 _LENGTHSCALE = 0.25
 _JITTER = 1e-6
 
-# === Additions for data.py ================================================
-# 1) Put these globals with the other constants (ensure `import math` exists):
-_LS_LOGNORMAL_MU    = math.log(0.5)
-_LS_LOGNORMAL_SIGMA = math.sqrt(0.5)
-
 _DATASET_CONFIGS: Dict[str, DatasetConfig] = {
     "se": DatasetConfig(max_input_dim=3, is_gp=True),
     "matern": DatasetConfig(max_input_dim=3, is_gp=True),
-    "matern_ln": DatasetConfig(max_input_dim=3, is_gp=True),
     "sawtooth": DatasetConfig(max_input_dim=1, is_gp=False),
     "step": DatasetConfig(max_input_dim=1, is_gp=False),
 }
@@ -244,41 +236,6 @@ def _matern_dataset_factory(active_dims: List[int]):
     return GPFunctionalDistribution(k)
 
 
-# 3) Add this dataset factory (near the other @register_dataset_factory defs):
-@register_dataset_factory("matern_ln")
-def _matern_logn_dataset_factory(active_dims: List[int]):
-    """
-    Matérn–5/2 GP where each *sample* draws a fresh lengthscale ℓ from a
-    LogNormal prior: ℓ ~ LogN(log(0.5), sqrt(0.5)). This creates training
-    data with many different hyperparameters, matching Sec. 6.1.1.
-    """
-    class _VarLenMatern(FunctionalDistribution):
-        def sample(self, x: Tensor, g: torch.Generator) -> Tensor:
-            # Draw ℓ ~ LogNormal(μ, σ) in a torch-friendly way
-            mu  = torch.tensor(_LS_LOGNORMAL_MU,    dtype=x.dtype, device=x.device)
-            sig = torch.tensor(_LS_LOGNORMAL_SIGMA, dtype=x.dtype, device=x.device)
-            log_ell = torch.normal(mu, sig, generator=g)
-            ell = float(torch.exp(log_ell))
-
-            Xa = x[:, active_dims]                  # [N, |active_dims|]
-            n  = Xa.size(0)
-            # Zero-mean GP with Matérn-5/2 kernel
-            K  = _matern52_kernel(Xa, Xa, lengthscale=ell, variance=1.0)
-            K  = K + _JITTER * torch.eye(n, device=x.device, dtype=x.dtype)
-
-            # Robust GP sampling via Cholesky: f ~ N(0, K)
-            L  = torch.linalg.cholesky(K)
-            z  = torch.randn(n, generator=g, device=x.device, dtype=x.dtype)
-            f  = L @ z
-
-            # Add homoscedastic observation noise
-            y  = f + math.sqrt(_NOISE_VAR) * torch.randn(n, generator=g, device=x.device, dtype=x.dtype)
-            return y.view(n, 1)  # [N,1]
-
-    return _VarLenMatern()
-# ==========================================================================
-
-
 class Sawtooth(FunctionalDistribution):
     A = 1.0
     K_max = 20
@@ -357,7 +314,6 @@ def get_batch(
         n_context = 0
     elif task == "interpolation":
         n_target = cfg.eval_num_target.high # Should be 50 here
-
         n_context = cfg.eval_num_context.sample( (1,), g=g).item() # Should be 1 to 10
     else:
         raise ValueError(f"Unknown task: {task}")
@@ -402,16 +358,5 @@ def get_batch(
         mask_target=mask_target,
         mask_context=mask_context,
     )
-
-
-
-
-
-
-
-
-
-
-
 
 
