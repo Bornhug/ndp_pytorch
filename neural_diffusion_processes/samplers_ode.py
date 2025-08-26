@@ -99,37 +99,76 @@ class EulerHeunSampler:
     def sample_cond(self, key: torch.Generator,
                     x_query: torch.Tensor, mask_tgt: Optional[torch.Tensor],
                     *, x_context: torch.Tensor, y_context: torch.Tensor, mask_context: Optional[torch.Tensor],
-                    model_fn: EpsModel, y_dim: int = 1, method: str = "euler"):
+                    model_fn: EpsModel, y_dim: int = 1, method: str = "heun",
+                    num_inner_steps: int = 5):
+        """
+        Conditional ODE sampling with RePaint-style inner loop.
+        Reuses _euler_predictor and _heun_corrector (no re-implementation).
+
+        For each outer σ_i → σ_{i+1}:
+          - Do U inner refinements:
+             (A) Backward ODE step (σ_i → σ_{i+1}) on the joint (ctx+qry),
+                 with contexts clamped to EDM form y_ctx(σ)=y_context+σ*z_ctx.
+             (B) If u < U-1: FORWARD *EDM* step (σ_{i+1} → σ_i) for QUERIES ONLY:
+                 y_q ← y_q + sqrt(σ_i^2 - σ_{i+1}^2) * ξ, ξ~N(0,I)
+          - After the inner loop we are already at σ_{i+1}.
+        """
         device = x_query.device
-        if mask_tgt is None:         mask_tgt = torch.zeros(x_query.size(0), device=device)
-        if mask_context is None:     mask_context = torch.zeros(x_context.size(0), device=device)
+        if mask_tgt is None:     mask_tgt = torch.zeros(x_query.size(0), device=device)
+        if mask_context is None: mask_context = torch.zeros(x_context.size(0), device=device)
         num_ctx = x_context.size(0)
 
-        y_t = torch.randn(x_query.size(0), y_dim, device=device, generator=key) * self.sigmas[0]
+        # init query at σ_max; fixed latent for contexts (kept for whole trajectory)
+        y_q = torch.randn(x_query.size(0), y_dim, device=device, generator=key) * self.sigmas[0]
+        z_ctx = torch.randn(y_context.shape,dtype=y_context.dtype,device=y_context.device,generator=key)
 
+        # concat once (used for all model calls)
+        x_aug = torch.cat([x_context, x_query], dim=0)
+        mask_aug = torch.cat([mask_context, mask_tgt], dim=0)
+
+        # wrapper keeps your model signature
+        def joint_model_fn(t_scalar, yt, xx, mm, *, key):
+            return model_fn(t_scalar, yt, xx, mm, key=key)
+
+        # IMPORTANT: keep s_churn = 0.0 for parity; otherwise contexts should use t_hat.
         for i in range(len(self.sigmas) - 1):
-            # simulate y_context at nearest DDPM index for σ_i
-            t_idx = self.c_noise(self.sigmas[i])
-            abar  = self.alpha_bars[t_idx]
-            a_i   = torch.sqrt(abar)
-            ai1   = torch.sqrt(1.0 - abar)
+            sigma_i = self.sigmas[i]
+            sigma_next = self.sigmas[i + 1]  # smaller
 
-            # eps_ctx = torch.randn_like(y_context, generator=key)
-            eps_ctx = torch.randn(
-                y_context.shape, dtype=y_context.dtype, device=y_context.device, generator=key
-            )
+            for u in range(num_inner_steps):
+                # (A) BACKWARD ODE step σ_i → σ_{i+1}
+                # clamp contexts at current σ_i (EDM coordinates)
+                y_ctx_i = y_context + sigma_i * z_ctx
+                y_aug = torch.cat([y_ctx_i, y_q], dim=0)
 
-            y_ctx_t = a_i * y_context + ai1 * eps_ctx
+                # Euler predictor
+                y_next, y_hat, t_next, t_hat, d = self._euler_predictor(
+                    y_aug, i, x_aug, mask_aug, joint_model_fn, key
+                )
 
-            x_aug    = torch.cat([x_context, x_query], dim=0)
-            mask_aug = torch.cat([mask_context, mask_tgt], dim=0)
-            y_aug    = torch.cat([y_ctx_t, y_t], dim=0)
+                # Heun corrector: 2nd slope must see contexts at σ_{i+1}
+                if method == "heun" and float(t_next) != 0.0:
+                    y_ctx_next = y_context + t_next * z_ctx
+                    y_next_aligned = torch.cat([y_ctx_next, y_next[num_ctx:]], dim=0)
+                    y_next = self._heun_corrector(
+                        y_next_aligned, y_hat, t_next, t_hat, d, x_aug, mask_aug, joint_model_fn, key
+                    )
 
-            def joint_model_fn(t_scalar, yt, xx, mm, *, key):
-                return model_fn(t_scalar, yt, xx, mm, key=key)
+                # keep only queries after the backward step
+                y_q = y_next[num_ctx:]
 
-            y_next, y_hat, t_next, t_hat, d = self._euler_predictor(y_aug, i, x_aug, mask_aug, joint_model_fn, key)
-            if method == "heun":
-                y_next = self._heun_corrector(y_next, y_hat, t_next, t_hat, d, x_aug, mask_aug, joint_model_fn, key)
-            y_t = y_next[num_ctx:]
-        return y_t
+                # (B) FORWARD *EDM* step σ_{i+1} → σ_i for QUERIES ONLY (RePaint refinement)
+                # do this only if there is another inner iteration to go
+                if u < num_inner_steps - 1:
+                    # Add the exact extra noise needed to go from σ_{i+1} back to σ_i in EDM:
+                    # y(σ_i) = y(σ_{i+1}) + sqrt(σ_i^2 - σ_{i+1}^2) * ξ
+                    delta_var = torch.clamp(sigma_i ** 2 - sigma_next ** 2, min=0.0)
+                    if float(delta_var) > 0.0:
+                        z = torch.randn(y_q.shape,device=y_q.device, dtype=y_q.dtype, generator=key)
+                        y_q = y_q + torch.sqrt(delta_var) * z
+
+            # After U inner loops, y_q is already at σ_{i+1}; continue to next i.
+
+        return y_q
+
+

@@ -67,6 +67,7 @@ def load_ema_model(cfg: Config, device: torch.device, ckpt_path: Path):
 
 def make_eps_model(model: torch.nn.Module, T: int):
     """
+    This function shifts the order of parameters from [x,y,t,m] in model.py to [t,y,x,m]
     Adapter: diffusion code will call fn(t, yt, x, mask, *, key).
     We ensure t is a valid Long index in [0, T-1].
     """
@@ -339,16 +340,18 @@ def main(
     print(f"✓ saved: {out_path}")
 
 
+
+
 if __name__ == "__main__":
     ckpt_file = Path("logs/regression/Aug11_161904_blgf/model_ema.pt")
-    sampler = "ddim"
-    num_steps = 25
+    sampler = "euler"
+    num_steps = 250
     main(
         ckpt=ckpt_file,
         mode="cond",          # or "uncond"
         n_points=50,
         n_funcs=8,
-        seed=0,
+        seed=10,
         sampler=sampler,       # "ddpm" | "ddim" | "euler" | "heun"
         num_steps=num_steps,         # (used by ddim/euler/heun)
         K=14,
