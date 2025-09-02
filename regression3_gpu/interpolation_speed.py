@@ -15,7 +15,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import torch
-from dataclasses import asdict
 
 # project imports – same as training
 from config import Config
@@ -25,6 +24,15 @@ from data import get_batch, Batch
 
 from neural_diffusion_processes.samplers_ddim import DDIMSampler
 from neural_diffusion_processes.samplers_ode  import EulerHeunSampler
+
+import json  # NEW
+
+# NEW: fixed-hyper GP core
+from likelihood import gp_posterior_fixed, mvn_loglik, mahalanobis2, GPHypersFixed
+
+# NEW: toggle & options
+DEFAULT_EVAL_GP = True                 # compute GP-likeness when in "cond" mode
+DEFAULT_INCLUDE_OBS_NOISE = True       # True: score y (with noise), False: latent f
 
 # ========================== USER DEFAULTS ==========================
 # You can change these defaults and just click "Run" in PyCharm.
@@ -82,6 +90,59 @@ def make_eps_model(model: torch.nn.Module, T: int):
         mask_b = None if mask is None else mask.unsqueeze(0)  # [N]   -> [1,N]
         return model(xx_b, yt_b, t_tensor, mask_b).squeeze(0)  # -> [N,1]
     return eps_model
+
+
+# ----------------------- Evaluating GP(Computing Log likelihood) ------------------------
+
+def _mask_query_columns(x_ctx: torch.Tensor, x_query: torch.Tensor) -> torch.Tensor:
+    x_concat = torch.cat([x_ctx, x_query], dim=0).squeeze(-1)  # [M+N]
+    M, N = x_ctx.size(0), x_query.size(0)
+    order = torch.argsort(x_concat)                            # [M+N]
+    is_query = torch.zeros(M + N, dtype=torch.bool, device=x_ctx.device)
+    is_query[M:M+N] = True
+    return is_query[order]
+
+
+def evaluate_gp_likeness_from_sorted_fixed(
+    dataset_name: str,
+    input_dim: int,
+    x_ctx: torch.Tensor, y_ctx: torch.Tensor,
+    x_query: torch.Tensor,
+    xs_sorted: torch.Tensor, ys_sorted: torch.Tensor,
+    include_obs_noise: bool = True,
+):
+    """
+    Scores each generated continuation (rows of ys_sorted restricted to query columns)
+    under the *fixed-parameter* GP posterior used by data.py.
+    """
+    active_dims = list(range(input_dim))
+
+    # GP posterior with fixed hypers & matching kernel
+    m, S, θ = gp_posterior_fixed(dataset_name, x_ctx, y_ctx, x_query, active_dims,
+                                 include_obs_noise=include_obs_noise)
+
+    # Extract only the query part from xs/ys, aligned with xs_sorted
+    mask_query = _mask_query_columns(x_ctx, x_query)   # [M+N]
+    yq_all = ys_sorted[:, mask_query]                  # [K, N]
+
+    # Score each sample
+    ll_list, q_list = [], []
+    for k in range(yq_all.size(0)):
+        yk = yq_all[k].double()
+        ll_list.append(mvn_loglik(yk, m, S).detach().cpu().item())
+        q_list.append(mahalanobis2(yk, m, S).detach().cpu().item())
+
+    ll = torch.tensor(ll_list)
+    q  = torch.tensor(q_list)
+    stats = {
+        "ell_eff": float(θ.ell_eff), "var": float(θ.var), "noise": float(θ.noise),
+        "mean_ll": float(ll.mean().item()), "std_ll": float(ll.std(unbiased=False).item()),
+        "mean_mahal": float(q.mean().item()), "std_mahal": float(q.std(unbiased=False).item()),
+        "K": int(yq_all.size(0)), "N": int(yq_all.size(1)),
+        "include_obs_noise": bool(include_obs_noise),
+    }
+    return stats, ll.tolist(), q.tolist()
+
 
 
 # ----------------------- Auto checkpoint ------------------------
@@ -340,6 +401,37 @@ def main(
     print(f"✓ saved: {out_path}")
 
 
+    # ==== GP-likeness under the *fixed* GP (matches data.py) ====
+    t1 = time.perf_counter()
+    stats, per_ll, per_mahal = evaluate_gp_likeness_from_sorted_fixed(
+        dataset_name=cfg.dataset,
+        input_dim=cfg.input_dim,
+        x_ctx=x_ctx, y_ctx=y_ctx,
+        x_query=x_query,
+        xs_sorted=xs, ys_sorted=ys,
+        include_obs_noise=True,     # score y (noisy observations); set False to score latent f
+    )
+    print("[gp-like/fixed] GP hypers:",
+          f"ell_eff={stats['ell_eff']:.4g}, var={stats['var']:.4g}, noise={stats['noise']:.4g}")
+    print("[gp-like/fixed] LL (mean±std over K): "
+          f"{stats['mean_ll']:.3f} ± {stats['std_ll']:.3f}")
+    print("[gp-like/fixed] Mahalanobis^2 (mean±std): "
+          f"{stats['mean_mahal']:.3f} ± {stats['std_mahal']:.3f}")
+    print(f"[gp-like/fixed] computed in {time.perf_counter() - t1:.2f}s")
+
+    # Save numbers next to the plot
+    out_json = out_path.with_suffix(".gp_eval.fixed.json")
+    payload = {
+        "sampler": sampler, "num_steps": num_steps, "seed": seed,
+        "K": stats["K"], "N": stats["N"], "include_obs_noise": stats["include_obs_noise"],
+        "gp_hypers": {"ell_eff": stats["ell_eff"], "var": stats["var"], "noise": stats["noise"]},
+        "likelihood": {"mean": stats["mean_ll"], "std": stats["std_ll"], "per_sample": per_ll},
+        "mahalanobis2": {"mean": stats["mean_mahal"], "std": stats["std_mahal"], "per_sample": per_mahal},
+    }
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_json, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"✓ saved GP eval (fixed): {out_json}")
 
 
 if __name__ == "__main__":

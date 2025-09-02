@@ -7,7 +7,7 @@ class DiffusionConfig:
     schedule: str = "cosine"
     beta_start: float = 3e-4
     beta_end: float = 0.5
-    timesteps: int = 500
+    timesteps: int = 250
 
 
 @dataclass
