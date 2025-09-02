@@ -255,6 +255,49 @@ class GaussianDiffusion:
 
 
 
+def loss(process: GaussianDiffusion,
+         network: EpsModel,
+         batch,
+         key: torch.Generator,
+         *,
+         num_timesteps: int,
+         loss_type: str = "l1") -> torch.Tensor:
+
+    metric = (lambda a, b: (a - b).abs()) if loss_type == "l1" \
+             else (lambda a, b: (a - b) ** 2)
+
+    # B = batch size, N = # of target points
+    B, N, y_dim = batch.y_target.shape
+
+    device = batch.y_target.device
+    t = torch.randint(0, num_timesteps, (B,), generator=key, device=device)  # [B]
+
+    # Expand for batched computation
+    t_ = t.view(B, 1, 1)                              # [B,1,1]
+    ᾱ_t = process.alpha_bars[t_].to(device)          # [B,1,1]
+    yt = torch.sqrt(ᾱ_t) * batch.y_target + \
+         torch.sqrt(1. - ᾱ_t) * torch.randn_like(batch.y_target)  # [B,N,1]
+
+    # Run model
+    noise_hat = network(
+        t.to(dtype=torch.float32),
+        yt,
+        batch.x_target,
+        batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device),
+        key=key
+    )
+    noise_true = (yt - torch.sqrt(ᾱ_t) * batch.y_target) / torch.sqrt(1. - ᾱ_t)
+
+    # Per-point loss
+    loss_per = metric(noise_true, noise_hat).sum(-1)  # [B,N]
+
+    mask_target = batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device)
+    mask = 1.0 - mask_target
+
+    loss_per = loss_per * mask                        # [B,N]
+
+    return loss_per.sum() / mask.sum()
+
 # ---------- training loss --------------------------------------------------
 # def loss(process: GaussianDiffusion,
 #                    network: EpsModel,
@@ -313,45 +356,3 @@ class GaussianDiffusion:
 #
 #     return torch.stack(losses, 0).mean()
 
-def loss(process: GaussianDiffusion,
-         network: EpsModel,
-         batch,
-         key: torch.Generator,
-         *,
-         num_timesteps: int,
-         loss_type: str = "l1") -> torch.Tensor:
-
-    metric = (lambda a, b: (a - b).abs()) if loss_type == "l1" \
-             else (lambda a, b: (a - b) ** 2)
-
-    # B = batch size, N = # of target points
-    B, N, y_dim = batch.y_target.shape
-
-    device = batch.y_target.device
-    t = torch.randint(0, num_timesteps, (B,), generator=key, device=device)  # [B]
-
-    # Expand for batched computation
-    t_ = t.view(B, 1, 1)                              # [B,1,1]
-    ᾱ_t = process.alpha_bars[t_].to(device)          # [B,1,1]
-    yt = torch.sqrt(ᾱ_t) * batch.y_target + \
-         torch.sqrt(1. - ᾱ_t) * torch.randn_like(batch.y_target)  # [B,N,1]
-
-    # Run model
-    noise_hat = network(
-        t.to(dtype=torch.float32),
-        yt,
-        batch.x_target,
-        batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device),
-        key=key
-    )
-    noise_true = (yt - torch.sqrt(ᾱ_t) * batch.y_target) / torch.sqrt(1. - ᾱ_t)
-
-    # Per-point loss
-    loss_per = metric(noise_true, noise_hat).sum(-1)  # [B,N]
-
-    mask_target = batch.mask_target if batch.mask_target is not None else torch.zeros(B, N, device=device)
-    mask = 1.0 - mask_target
-
-    loss_per = loss_per * mask                        # [B,N]
-
-    return loss_per.sum() / mask.sum()
