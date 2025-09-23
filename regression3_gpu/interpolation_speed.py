@@ -40,7 +40,7 @@ DEFAULT_MODE      = "uncond"   # "uncond" or "cond"
 DEFAULT_N_POINTS  = 50        # number of x points to sample on
 DEFAULT_N_FUNCS   = 8          # curves for unconditional mode
 DEFAULT_SEED      = 0
-DEFAULT_OUT       = Path("samples") / "out_euler_steps25.png"
+DEFAULT_OUT       = Path("samples") / "out_ddpm_steps500.png"
 DEFAULT_LOG_ROOT  = Path("logs") / "regression"   # where runs live
 
 
@@ -73,23 +73,38 @@ def load_ema_model(cfg: Config, device: torch.device, ckpt_path: Path):
     model.eval()
     return model
 
+
+
+# in interpolation_speed.py (and use the same idea for the training-time _plot_samples adapter if needed)
 def make_eps_model(model: torch.nn.Module, T: int):
     """
-    This function shifts the order of parameters from [x,y,t,m] in model.py to [t,y,x,m]
-    Adapter: diffusion code will call fn(t, yt, x, mask, *, key).
-    We ensure t is a valid Long index in [0, T-1].
+    Adapter so the samplers can call: fn(t, yt, x_aug, mask_aug, *, key)
+    We split x_aug, yt by mask into (context, target) and pass them to the model.
     """
     def eps_model(t, yt, xx, mask, *, key):
-        # t may arrive as Python int, float tensor, 0-d tensor, etc.
-        t_tensor = torch.as_tensor(t, device=xx.device).long()
-        # clamp to [0, T-1] to avoid GPU index errors
-        t_tensor = torch.clamp(t_tensor, 0, T - 1).view(1)
+        # t → [1] Long within [0, T-1]
+        t_tensor = torch.as_tensor(t, device=xx.device).long().clamp_(0, T - 1).view(1)
 
-        xx_b   = xx.unsqueeze(0)                              # [N,D] -> [1,N,D]
-        yt_b   = yt.unsqueeze(0)                              # [N,1] -> [1,N,1]
-        mask_b = None if mask is None else mask.unsqueeze(0)  # [N]   -> [1,N]
-        return model(xx_b, yt_b, t_tensor, mask_b).squeeze(0)  # -> [N,1]
+        # mask semantics in our code: 1 == "context row" (kept fixed); 0 == "target row"
+        is_ctx = (mask > 0.5)
+        x_ctx,  y_ctx  = xx[is_ctx],  yt[is_ctx]          # [M,D], [M,1]
+        x_tgt,  y_tgt  = xx[~is_ctx], yt[~is_ctx]         # [N,D], [N,1]
+
+        # add batch dim; allow "no context" case gracefully
+        x_tgt = x_tgt.unsqueeze(0); y_tgt = y_tgt.unsqueeze(0)
+        m_tgt = mask[~is_ctx].unsqueeze(0) if mask is not None else None
+
+        if x_ctx.numel() == 0:
+            x_ctx_b = y_ctx_b = m_ctx_b = None
+        else:
+            x_ctx_b = x_ctx.unsqueeze(0); y_ctx_b = y_ctx.unsqueeze(0)
+            m_ctx_b = torch.zeros(x_ctx_b.size(1), device=xx.device).unsqueeze(0)  # all valid
+
+        out = model(x_tgt, y_tgt, t_tensor, m_tgt,
+                    x_context=x_ctx_b, y_context=y_ctx_b, mask_context=m_ctx_b)
+        return out.squeeze(0)  # [N,1]
     return eps_model
+
 
 
 # ----------------------- Evaluating GP(Computing Log likelihood) ------------------------
@@ -350,8 +365,8 @@ def main(
         )
     print(f"Using checkpoint: {ckpt_path}")
 
-    model = load_ema_model(cfg, device, ckpt_path)
-    process = build_process(cfg, device)
+    model = load_ema_model(cfg, device, ckpt_path) # Class: BiDimentionalAttentionModel
+    process = build_process(cfg, device) # class GaussianDiffusion
 
     t0 = time.time()
     #plot_exact_like_training(model, process, cfg, device, "samples/like_training.png")
@@ -435,9 +450,9 @@ def main(
 
 
 if __name__ == "__main__":
-    ckpt_file = Path("logs/regression/Aug11_161904_blgf/model_ema.pt")
-    sampler = "euler"
-    num_steps = 250
+    ckpt_file = Path("logs/regression/Sep13_142401_zoqr_t_outblocks/model_ema.pt")
+    sampler = "ddpm"
+    num_steps = 25
     main(
         ckpt=ckpt_file,
         mode="cond",          # or "uncond"
@@ -447,6 +462,6 @@ if __name__ == "__main__":
         sampler=sampler,       # "ddpm" | "ddim" | "euler" | "heun"
         num_steps=num_steps,         # (used by ddim/euler/heun)
         K=14,
-        out_path=Path(f"logs/regression/Aug11_161904_blgf/out_{sampler}_steps{num_steps}.png"),
+        out_path=Path(f"logs/regression/Sep13_142401_zoqr_t_outblocks/out_{sampler}_steps{num_steps}.png"),
     )
 

@@ -44,6 +44,21 @@ def _experiment_name() -> str:
 def _device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def _save_fig(fig, path: Path, show_live: bool = False, dpi: int = 200):
+    fig.tight_layout()
+    fig.savefig(path.as_posix(), dpi=dpi)
+    if show_live:
+        import matplotlib.pyplot as plt
+        plt.show(block=False)
+        plt.pause(0.001)
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
 # ------------------------------------------------------------------ #
 #  Dataset wrapper                                                   #
 # ------------------------------------------------------------------ #
@@ -58,14 +73,27 @@ class InfiniteDataset(IterableDataset):
         print(base_seed)
         g = torch.Generator().manual_seed(base_seed)
         while True:
-            #gen = torch.Generator().manual_seed(self.cfg.seed)  # ✅ move here
-            yield get_batch(
-                g,                                   # positional
+            raw = get_batch(
+                g,
                 batch_size=self.cfg.batch_size,
                 name=self.cfg.dataset,
                 task="training" if self.train else "interpolation",
                 input_dim=self.cfg.input_dim,
+                gp_conditional_targets=True,  # ← use GP conditional targets
+                p_drop_ctx=0.2,  # ← classifier-free style (tweak as you like)
             )
+
+            # Build the ndp.types.Batch expected by ndp.process.loss using POSITIONAL args
+            # (avoid keywords; your error came from unexpected keyword 'x')
+            tb = Batch(x_target=raw.x_target, y_target=raw.y_target, mask_target=raw.mask_target)
+
+            # Attach context so the loss-closure can forward it into the model
+            tb.x_context = raw.x_context
+            tb.y_context = raw.y_context
+            tb.mask_context = raw.mask_context
+
+            yield tb
+
 
 # ------------------------------------------------------------------ #
 def build_network(cfg: Config) -> nn.Module:
@@ -87,29 +115,25 @@ def _ema_update(ema: nn.Module, online: nn.Module, decay: float):
     for p_ema, p in zip(ema.parameters(), online.parameters()):
         p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
-def make_loss_fn(process: GaussianDiffusion, cfg: Config):
-    def _loss_fn(
-        model: torch.nn.Module, # BidimentionalAttentionModel
-        batch: Batch,
-        key: torch.Generator,          # positional, not a kwarg
-    ) -> torch.Tensor:
-
-        # --- adapter: reorder args & ignore `key` -----------------
+def make_loss_fn(process, cfg):
+    def _loss_fn(model, batch, key):
         def eps_model(t, yt, x, mask, *, key):
-            # t: [B], yt: [B,N,1], x: [B,N,D], mask: [B,N]
-            return model(x, yt, t, mask)  # returns [B,N,1]
+            # Ensure yt is [B,N,1]
+            if yt.ndim == 3 and yt.shape[1] == 1 and yt.shape[2] == x.shape[1]:
+                yt = yt.transpose(1, 2)
 
-        # pos. args: process, network, batch, key
-        # kw-only: num_timesteps, loss_type
-        return ndp.process.loss(
-            process,                    # GaussianDiffusion
-            eps_model,                      # your BiDim model
-            batch,                      # Batch instance
-            key,                        # <— here!
-            num_timesteps=cfg.diffusion.timesteps,
-            loss_type=cfg.loss_type,
-        )
+            return model(
+                x, yt, t, mask,
+                x_context=getattr(batch, "x_context", None),
+                y_context=getattr(batch, "y_context", None),
+                mask_context=getattr(batch, "mask_context", None),
+            )
+        return ndp.process.loss(process, eps_model, batch, key,
+                                num_timesteps=cfg.diffusion.timesteps,
+                                loss_type=cfg.loss_type)
     return _loss_fn
+
+
 
 
 # ------------------------------------------------------------------ #
@@ -120,14 +144,15 @@ def train(cfg: Config):
     print("Logging to:", log_dir)
 
 
-    # ── TensorBoard writer ─────────────────────────────────────────────
-    tb_dir = log_dir / "tb"
-    writer = SummaryWriter(tb_dir.as_posix())
-    try:
-        writer.add_text("config/json", f"```json\n{json.dumps(asdict(cfg), indent=2)}\n```", global_step=0)
-    except Exception:
-        writer.add_text("config/str", str(asdict(cfg)), global_step=0)
+    # # ── TensorBoard writer ─────────────────────────────────────────────
+    # tb_dir = log_dir / "tb"
+    # writer = SummaryWriter(tb_dir.as_posix())
+    # try:
+    #     writer.add_text("config/json", f"```json\n{json.dumps(asdict(cfg), indent=2)}\n```", global_step=0)
+    # except Exception:
+    #     writer.add_text("config/str", str(asdict(cfg)), global_step=0)
     # ───────────────────────────────────────────────────────────────────
+    plots_dir = log_dir / "plots"
 
     data = DataLoader(
         InfiniteDataset(cfg, train=True),
@@ -142,6 +167,10 @@ def train(cfg: Config):
     model_ema.load_state_dict(model.state_dict()) # make the initial paras of model_ema identical to model
     process   = build_process(cfg)
     loss_fn   = make_loss_fn(process, cfg)
+
+    print("model.hidden_dim =", model.hidden_dim)
+    # print("mha_crossD K weight shape =",
+    #       tuple(model.layers[0].mha_crossD.k_proj.weight.shape))
 
     # ---- optimiser & LR schedule (warm-up + cosine) ---------------------
     optimiser = AdamW(model.parameters(),
@@ -167,7 +196,11 @@ def train(cfg: Config):
     pbar = tqdm.tqdm(range(1, total_steps + 1))
 
     for step, batch in zip(pbar, data):
-        batch = Batch(**{k: v.to(device, non_blocking=True) for k, v in batch.__dict__.items()})
+        # ✅ Keep the same object; move any tensors in-place
+        for k, v in list(batch.__dict__.items()):
+            if torch.is_tensor(v):
+                batch.__dict__[k] = v.to(device, non_blocking=True)
+
         # if step == 1:
         #     debug_batch(batch, dataset_name=cfg.dataset, active_dims=list(range(cfg.input_dim)),
         #                 title=f"Step_{step}_input_data")
@@ -182,19 +215,21 @@ def train(cfg: Config):
         _ema_update(model_ema, model, cfg.optimizer.ema_rate)
 
         # ── TensorBoard scalars ────────────────────────────────────────
-        writer.add_scalar("train/loss", float(loss.item()), step)
-        writer.add_scalar("train/lr", lr_sched.get_last_lr()[0], step)
-        writer.add_scalar("train/grad_norm", grad_norm, step)
+        # writer.add_scalar("train/loss", float(loss.item()), step)
+        # writer.add_scalar("train/lr", lr_sched.get_last_lr()[0], step)
+        # writer.add_scalar("train/grad_norm", grad_norm, step)
         # ───────────────────────────────────────────────────────────────
 
         if step % 100 == 0 or step == 1:
             pbar.set_description(f"loss {loss.item():.3f} • lr {lr_sched.get_last_lr()[0]:.2e}")
 
         if step == 1 or step % (total_steps // 8) == 0: # TODO: 4 set the num of plots
-            _plot_samples(model_ema, process, cfg, device,
-                          title=f"step_{step:07d}",
-                          out_dir=log_dir / "plots",
-                          writer=writer, step=step)
+            _plot_samples(
+                model_ema, process, cfg, device,
+                title=f"step_{step:07d}",
+                out_dir=plots_dir,
+                show_live=False,  # set True if you want pop-up windows
+            )
 
         if step >= total_steps:
             break
@@ -204,38 +239,39 @@ def train(cfg: Config):
 
 # ------------------------------------------------------------------ #
 @torch.no_grad()
-def _plot_samples(model, process, cfg, device, title, out_dir: Path, writer: SummaryWriter | None = None, step: int | None = None):
+def _plot_samples(model, process, cfg, device, title, out_dir: Path, show_live: bool = False):
+    """Save unconditional samples as a PNG via matplotlib (no TensorBoard)."""
     if cfg.input_dim != 1:
         return
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    x = torch.linspace(-2, 2, 60, device=device).unsqueeze(-1)
-    #x = torch.linspace(-2, 2, 60, device=device).unsqueeze(0).unsqueeze(-1)  # [1, 60, 1]
+    _ensure_dir(out_dir)
 
-    net_fn = lambda t, yt, xx, m, *, key: (
-        model(  # BiDimensionalAttentionModel
-            xx.unsqueeze(0),  # [N,D] ➜ [1,N,D]
-            yt.unsqueeze(0),  # [N,1] ➜ [1,N,1]
-            t.view(1),  # []    ➜ [1]
+    import matplotlib.pyplot as plt
+    x = torch.linspace(-2, 2, 60, device=device).unsqueeze(-1)  # [N,1]
+
+    # model closure for the diffusion sampler
+    def net_fn(t, yt, xx, m, *, key):
+        out = model(
+            xx.unsqueeze(0),   # [N,1] -> [1,N,1]
+            yt.unsqueeze(0),   # [N,1] -> [1,N,1]
+            t.view(1),         # []    -> [1]
             m.unsqueeze(0) if m is not None else m
-        ).squeeze(0)  # back to [N,1] for the diffusion code
-    )
+        )
+        return out.squeeze(0)  # [N,1]
 
     gen = torch.Generator(device=device).manual_seed(0)
-    ys = torch.stack([process.sample(gen, x, None, model_fn=net_fn) for _ in range(8)]
-                     ).squeeze(-1)  # [8,N]
+    ys = torch.stack([process.sample(gen, x, None, model_fn=net_fn) for _ in range(8)])  # [8,N,1]
+    ys = ys.squeeze(-1).cpu()   # [8,N]
+    xx = x[:, 0].detach().cpu() # [N]
 
-    fig = plt.figure(figsize=(4, 3))
-    plt.plot(x.cpu(), ys.cpu().T, color="C0", alpha=0.5)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_dir / f"{title}.png", dpi=200)
+    fig, ax = plt.subplots(figsize=(5.0, 3.5), dpi=150)
+    for i in range(ys.shape[0]):
+        ax.plot(xx, ys[i], alpha=0.6)
+    ax.set_title(title)
+    ax.set_xlabel("x"); ax.set_ylabel("y")
 
-    # Log to TensorBoard
-    if writer is not None and step is not None:
-        writer.add_figure("samples/unconditional_grid", fig, global_step=step)
+    _save_fig(fig, out_dir / f"{title}.png", show_live=show_live)
 
-    plt.close()
 
 # ------------------------------------------------------------------ #
 def main():
@@ -251,65 +287,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# def plot_gp_batch(batch, title="Step 1 GP samples"):
-#     import matplotlib.pyplot as plt
-#
-#     x_t = batch.x_target.detach().cpu()   # [B, N, 1]
-#     y_t = batch.y_target.detach().cpu()   # [B, N, 1]
-#     B, N, _ = x_t.shape
-#
-#     plt.figure(figsize=(6,4))
-#     for i in range(min(8, B)):
-#         x = x_t[i, :, 0]
-#         y = y_t[i, :, 0]
-#         idx = torch.argsort(x)            # sort indices by x
-#         plt.plot(x[idx], y[idx], alpha=0.7)
-#     plt.xlabel("x"); plt.ylabel("y"); plt.title(title)
-#     plt.tight_layout();
-#     plt.savefig(f"test_gp.png", dpi=200)
-#     plt.close()
-#     print(f"Saved test_gp.png")
-#
-#
-# def print_tensor_stats(name, value):
-#     if value.numel() == 0:
-#         print(f"  ⚠ {name} is empty: shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}")
-#         return
-#
-#     print(f"  🔹 {name}: {{"
-#           f"'shape': {tuple(value.shape)}, "
-#           f"'dtype': '{value.dtype}', "
-#           f"'device': '{value.device}', "
-#           f"'mean': {value.float().mean().item():.6f}, "
-#           f"'var': {value.float().var(unbiased=False).item():.6f}, "
-#           f"'min': {value.min().item():.6f}, "
-#           f"'max': {value.max().item():.6f}}}")
-#
-# def debug_batch(batch, dataset_name=None, active_dims=None, title="Batch Debug Plot", out_dir="debug_plots"):
-#     import os
-#     import matplotlib.pyplot as plt
-#     os.makedirs(out_dir, exist_ok=True)
-#
-#     # Tensor stats
-#     for k, v in batch.__dict__.items():
-#         print_tensor_stats(k, v)
-#
-#     # Plot if 1D input
-#     if batch.x_context.shape[-1] == 1 and batch.x_target.shape[-1] == 1:
-#         if batch.x_context.numel() > 0 and batch.y_context.numel() > 0:
-#             plt.scatter(batch.x_context.cpu(), batch.y_context.cpu(), color='blue', label="Context", s=20)
-#         if batch.x_target.numel() > 0 and batch.y_target.numel() > 0:
-#             plt.scatter(batch.x_target.cpu(), batch.y_target.cpu(), color='red', label="Target", s=20, alpha=0.6)
-#
-#         plt.title(title)
-#         plt.legend()
-#         plt.tight_layout()
-#         file_path = os.path.join(out_dir, f"{title.replace(' ', '_')}.png")
-#         plt.savefig(file_path, dpi=150)
-#         plt.close()
-#         print(f"Saved plot to {file_path}")
-#
-#     plot_gp_batch(batch)
-
-

@@ -250,7 +250,9 @@ def sample_cond(cfg, model, process, device, x_context, y_context, x_query,
     T = int(process.betas.numel())
     net_fn = make_eps_model(model, T)
 
-    m_ctx = torch.zeros(x_context.size(0), device=device)  # [M]
+    #TODO:
+    #m_ctx = torch.zeros(x_context.size(0), device=device)  # [M]
+    m_ctx = torch.ones(x_context.size(0), device=device)  # [M]  1 ⇒ context
     m_tgt = torch.zeros(x_query.size(0),   device=device)  # [N]
 
     # Build plotting x once and its permutation
@@ -274,7 +276,7 @@ def sample_cond(cfg, model, process, device, x_context, y_context, x_query,
             y_q = process.conditional_sample(
                 g, x_query, m_tgt,
                 x_context=x_context, y_context=y_context,
-                mask_context=m_ctx, model_fn=net_fn
+                mask_context=m_ctx, model_fn=net_fn, method="unified"
             )  # [N,1]
         elif sampler == "ddim":
             y_q = ddim_sampler.sample_cond(
@@ -605,6 +607,6 @@ if __name__ == "__main__":
         num_steps=num_steps,         # (used by ddim/euler/heun)
         K=K,
         out_path=Path(f"logs/regression/Sep09_205729_tyui/out_{sampler}_steps{num_steps}_K{K}.png"),
-        compute_fixed = False, compute_real = True, compute_ceiling = True
+        compute_fixed = True, compute_real = False, compute_ceiling = False
     )
 
