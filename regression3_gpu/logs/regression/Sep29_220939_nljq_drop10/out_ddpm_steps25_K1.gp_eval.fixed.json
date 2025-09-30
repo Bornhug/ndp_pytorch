@@ -1,0 +1,27 @@
+{
+  "sampler": "ddpm",
+  "num_steps": 25,
+  "seed": 10,
+  "K": 1,
+  "N": 250,
+  "include_obs_noise": true,
+  "gp_hypers": {
+    "ell_eff": 0.25,
+    "var": 1.0,
+    "noise": 0.0025000000000000005
+  },
+  "likelihood": {
+    "mean": 389.3645324707031,
+    "std": 0.0,
+    "per_sample": [
+      389.3645324707031
+    ]
+  },
+  "mahalanobis2": {
+    "mean": 45.76468276977539,
+    "std": 0.0,
+    "per_sample": [
+      45.76468276977539
+    ]
+  }
+}
