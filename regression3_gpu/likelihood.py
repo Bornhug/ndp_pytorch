@@ -352,8 +352,12 @@ def vp_probflow_loglik_conditional(
         # map t∈[0,1] → discrete idx ∈ {0,…,T-1}
         t_unit_clamped = t_unit.clamp(eps, 1.0 - eps)
         t_idx = _time_index_from_unit(t_unit_clamped, T)              # Long []
-        beta_t = betas[t_idx]                                         # []
+        # TODO: add * float(T)
+        beta_t = betas[t_idx] * float(T)                                    # []
+        #print("t_unit:", t_unit)
+       # print("beta_t:",beta_t)
         abar_t = alpha_bars[t_idx]                                    # []
+        #print("abar_t:",abar_t)
 
         # model expects batched tensors
         y_in  = y_t.unsqueeze(0)                                      # [1,N,1]
@@ -396,14 +400,15 @@ def vp_probflow_loglik_conditional(
             t_scalar_clamped = float(min(max(t_scalar, eps), 1.0 - eps))
             drift = f_pf(y_state, torch.tensor(t_scalar_clamped, dtype=dtype, device=device)).view(-1)
             div = div_at(y_state, t_scalar).view(1)
-            rhs = torch.cat([drift, -div], dim=0)
+            #TODO: sign of div
+            rhs = torch.cat([drift, div], dim=0)
             return rhs.detach().cpu().numpy()
 
         state0 = torch.cat([y.view(-1), delta_logp.view(1)], dim=0).detach().cpu().numpy()
         # Let solve_ivp choose adaptive step sizes entirely (no explicit max_step)
         sol = solve_ivp(
             aug_rhs,
-            t_span=(0.0, 1.0),
+            t_span=(eps, 1.0),
             y0=state0,
             method="RK45",
             rtol=rtol,
@@ -445,14 +450,15 @@ def vp_probflow_loglik_conditional(
 
             # Heun updates
             y = y + 0.5 * dt * (f1 + f2)
-            delta_logp = delta_logp + 0.5 * dt * ( -div1 - div2 )
+            delta_logp = delta_logp + 0.5 * dt * ( div1 + div2 )
 
             t = t2
 
     # Terminal prior for VP: standard Normal N(0, I)
     D = y.numel()   # N * 1
     log_pT = -0.5 * (D * math.log(2.0 * math.pi) + (y * y).sum())
-
+    print(f"log_pT: {log_pT:.3f}")
+    print(f"delta_logp: {delta_logp:.3f}")
     return (log_pT + delta_logp).to(dtype=torch.float32)
 
 

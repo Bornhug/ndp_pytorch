@@ -20,25 +20,39 @@ import torch
 from config import Config
 from neural_diffusion_processes.model   import BiDimensionalAttentionModel
 from neural_diffusion_processes.process import GaussianDiffusion, cosine_schedule
-from data import get_batch, Batch
-
 from neural_diffusion_processes.samplers_ddim import DDIMSampler
 from neural_diffusion_processes.samplers_ode  import EulerHeunSampler
 
 import json  # NEW
-
+import math
+from contextlib import nullcontext
+from itertools import repeat
+from typing import Iterable
 # NEW: fixed-hyper GP core
-from likelihood import gp_posterior_fixed, mvn_loglik, mahalanobis2, GPHypersFixed
+# NEW: fixed-hyper GP core
+# interpolation_speed_baseline.py (CHANGE import line)
+from likelihood import (
+    estimate_kl_from_pf_lls, gaussian_entropy_from_cov,
+    gp_posterior_fixed,
+    gp_prior_fixed,
+    mvn_loglik,
+    mahalanobis2,
+    GPHypersFixed,
+    sample_gp_conditional_fixed,
+    vp_probflow_loglik_conditional
+)
 
 # NEW: toggle & options
 DEFAULT_EVAL_GP = True                 # compute GP-likeness when in "cond" mode
 DEFAULT_INCLUDE_OBS_NOISE = True       # True: score y (with noise), False: latent f
 
+from data import _DATASET_FACTORIES, _JITTER, _NOISE_VAR  # same constants as in get_batch
+
 # ========================== USER DEFAULTS ==========================
 # You can change these defaults and just click "Run" in PyCharm.
 DEFAULT_MODE      = "uncond"   # "uncond" or "cond"
 DEFAULT_N_POINTS  = 50        # number of x points to sample on
-DEFAULT_N_FUNCS   = 8          # curves for unconditional mode
+DEFAULT_N_FUNCS   = 8          # curves for vanilla mode
 DEFAULT_SEED      = 0
 DEFAULT_OUT       = Path("samples") / "out_ddpm_steps500.png"
 DEFAULT_LOG_ROOT  = Path("logs") / "regression"   # where runs live
@@ -117,6 +131,40 @@ def _mask_query_columns(x_ctx: torch.Tensor, x_query: torch.Tensor) -> torch.Ten
     is_query[M:M+N] = True
     return is_query[order]
 
+
+# interpolation_speed_baseline.py (ADD)
+@torch.no_grad()
+def evaluate_gp_prior_uncond(
+    dataset_name: str,
+    input_dim: int,
+    x: torch.Tensor,          # [N,1]
+    ys: torch.Tensor,         # [S,N]   (each row is one function sample)
+    include_obs_noise: bool = True,
+):
+    """
+    Scores each vanilla sample curve y_k(x) under the *prior* GP:
+        log N(y_k ; m_prior=0, K(x,x)[+noise I])
+    """
+    active_dims = list(range(input_dim))
+    m, S, θ = gp_prior_fixed(dataset_name, x, active_dims, include_obs_noise=include_obs_noise)
+
+    ys = ys.double()
+    ll_list, q_list = [], []
+    for k in range(ys.size(0)):
+        yk = ys[k]
+        ll_list.append(mvn_loglik(yk, m, S).detach().cpu().item())
+        q_list.append(mahalanobis2(yk, m, S).detach().cpu().item())
+
+    ll = torch.tensor(ll_list)
+    q  = torch.tensor(q_list)
+    stats = {
+        "ell_eff": float(θ.ell_eff), "var": float(θ.var), "noise": float(θ.noise),
+        "mean_ll": float(ll.mean().item()), "std_ll": float(ll.std(unbiased=False).item()),
+        "mean_mahal": float(q.mean().item()), "std_mahal": float(q.std(unbiased=False).item()),
+        "S": int(ys.size(0)), "N": int(ys.size(1)),
+        "include_obs_noise": bool(include_obs_noise),
+    }
+    return stats, ll_list, q_list
 
 def evaluate_gp_likeness_from_sorted_fixed(
     dataset_name: str,
@@ -340,6 +388,626 @@ def plot_conditional(xs, ys, x_ctx, y_ctx, out_path: Path, title="Conditional sa
 
 
 
+# ---------------------- Evaluation helpers ----------------------
+
+def run_evaluations(
+    *,
+    mode,
+    cfg,
+    model,
+    process,
+    device,
+    n_points,
+    n_funcs,
+    seed,
+    sampler,
+    num_steps,
+    K,
+    include_obs_noise,
+    out_path,
+    x_ctx,
+    y_ctx,
+    x_query,
+    compute_fixed,
+    compute_real,
+    compute_ceiling,
+    compute_gp_sample_loglik,
+    compute_noise,
+):
+    posterior = None
+
+    def _ensure_posterior():
+        nonlocal posterior
+        if posterior is None:
+            posterior = gp_posterior_fixed(
+                cfg.dataset,
+                x_ctx,
+                y_ctx,
+                x_query,
+                list(range(cfg.input_dim)),
+                include_obs_noise=include_obs_noise,
+            )
+        return posterior
+
+    if compute_fixed:
+        t0 = time.time()
+        print(f"[timing] plot_exact_like_training took {time.time() - t0:.2f} sec")
+
+        if mode == "uncond":
+            if cfg.input_dim != 1:
+                raise ValueError("Unconditional plotting assumes input_dim == 1.")
+
+            print(
+                f"[timing] → start sample_uncond/{sampler} "
+                f"({('T=' + str(process.betas.numel())) if sampler=='ddpm' else ('S=' + str(num_steps))}, "
+                f"n_funcs={n_funcs})"
+            )
+            t0 = time.perf_counter()
+            x, ys = sample_uncond(
+                cfg,
+                model,
+                process,
+                device,
+                n_points=n_points,
+                n_funcs=n_funcs,
+                seed=seed,
+                sampler=sampler,
+                num_steps=num_steps,
+            )
+            sample_time_sec = time.perf_counter() - t0
+            print(f"[timing] ← end   sample_uncond/{sampler}: {sample_time_sec:.2f}s")
+            plot_uncond(x, ys, out_path, title="Unconditional samples")
+            print(f"✓ saved: {out_path}")
+
+            stats_p, per_ll_p, per_mahal_p = evaluate_gp_prior_uncond(
+                dataset_name=cfg.dataset,
+                input_dim=cfg.input_dim,
+                x=x,
+                ys=ys,
+                include_obs_noise=include_obs_noise,
+            )
+
+            print(
+                "[gp-prior/uncond] GP hypers:",
+                f"ell_eff={stats_p['ell_eff']:.4g}, var={stats_p['var']:.4g}, noise={stats_p['noise']:.4g}"
+            )
+            print(
+                "[gp-prior/uncond] LL (mean±std over S): ",
+                f"{stats_p['mean_ll']:.3f} ± {stats_p['std_ll']:.3f}"
+            )
+            print(
+                "[gp-prior/uncond] Mahalanobis^2 (mean±std): ",
+                f"{stats_p['mean_mahal']:.3f} ± {stats_p['std_mahal']:.3f}"
+            )
+
+            out_json_prior = out_path.with_suffix(".gp_eval.prior.json")
+            payload_prior = {
+                "sampler": sampler,
+                "num_steps": num_steps,
+                "seed": seed,
+                "sampling_time_sec": sample_time_sec,
+                "S": stats_p["S"],
+                "N": stats_p["N"],
+                "include_obs_noise": stats_p["include_obs_noise"],
+                "gp_hypers": {
+                    "ell_eff": stats_p["ell_eff"],
+                    "var": stats_p["var"],
+                    "noise": stats_p["noise"],
+                },
+                "likelihood": {
+                    "mean": stats_p["mean_ll"],
+                    "std": stats_p["std_ll"],
+                    "per_sample": per_ll_p,
+                },
+                "mahalanobis2": {
+                    "mean": stats_p["mean_mahal"],
+                    "std": stats_p["std_mahal"],
+                    "per_sample": per_mahal_p,
+                },
+            }
+            out_json_prior.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_json_prior, "w") as f:
+                json.dump(payload_prior, f, indent=2)
+            print(f"✓ saved GP prior eval (uncond): {out_json_prior}")
+            return True
+
+        print(
+            f"[timing] → start sample_cond/{sampler} "
+            f"({('T=' + str(process.betas.numel())) if sampler=='ddpm' else ('S=' + str(num_steps))}, K={K})"
+        )
+        t0 = time.perf_counter()
+        xs, ys = sample_cond(
+            cfg,
+            model,
+            process,
+            device,
+            x_context=x_ctx,
+            y_context=y_ctx,
+            x_query=x_query,
+            seed=seed,
+            sampler=sampler,
+            num_steps=num_steps,
+            K=K,
+        )
+        sample_time_sec = time.perf_counter() - t0
+        print(f"[timing] ← end   sample_cond/{sampler}: {sample_time_sec:.2f}s")
+        plot_conditional(xs, ys, x_ctx.squeeze(-1), y_ctx.squeeze(-1), out_path, title="Conditional sample")
+        print(f"✓ saved: {out_path}")
+
+        t1 = time.perf_counter()
+        stats, per_ll, per_mahal = evaluate_gp_likeness_from_sorted_fixed(
+            dataset_name=cfg.dataset,
+            input_dim=cfg.input_dim,
+            x_ctx=x_ctx,
+            y_ctx=y_ctx,
+            x_query=x_query,
+            xs_sorted=xs,
+            ys_sorted=ys,
+            include_obs_noise=include_obs_noise,
+        )
+        print(
+            "[gp-like/fixed] GP hypers:",
+            f"ell_eff={stats['ell_eff']:.4g}, var={stats['var']:.4g}, noise={stats['noise']:.4g}"
+        )
+        print(
+            "[gp-like/fixed] LL (mean±std over K): ",
+            f"{stats['mean_ll']:.3f} ± {stats['std_ll']:.3f}"
+        )
+        print(
+            "[gp-like/fixed] Mahalanobis^2 (mean±std): ",
+            f"{stats['mean_mahal']:.3f} ± {stats['std_mahal']:.3f}"
+        )
+        print(f"[gp-like/fixed] computed in {time.perf_counter()-t1:.2f}s")
+
+        suffix_base = f".gp_eval.fixed_ctx{int(x_ctx.size(0))}.json"
+        out_json = out_path.with_suffix(suffix_base)
+        payload = {
+            "sampler": sampler,
+            "num_steps": num_steps,
+            "seed": seed,
+            "sampling_time_sec": sample_time_sec,
+            "K": stats["K"],
+            "N": stats["N"],
+            "include_obs_noise": stats["include_obs_noise"],
+            "gp_hypers": {
+                "ell_eff": stats["ell_eff"],
+                "var": stats["var"],
+                "noise": stats["noise"],
+            },
+            "likelihood": {
+                "mean": stats["mean_ll"],
+                "std": stats["std_ll"],
+                "per_sample": per_ll,
+            },
+            "mahalanobis2": {
+                "mean": stats["mean_mahal"],
+                "std": stats["std_mahal"],
+                "per_sample": per_mahal,
+            },
+        }
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"✓ saved GP eval (fixed): {out_json}")
+
+
+
+        if compute_gp_sample_loglik:
+            if cfg.dataset not in {"se", "matern"}:
+                print("[gp-sample/loglik] Skipping: dataset not GP (requires 'se' or 'matern').")
+            elif x_ctx.size(0) == 0:
+                print("[gp-sample/loglik] Skipping: no context points available.")
+            else:
+                pf_gp_lls: list[float] = []
+                gp_rng = torch.Generator(device=x_query.device)
+                gp_rng.manual_seed(seed + 12345)
+
+                iterator: Iterable[int]
+                progress_context = nullcontext()
+                if K > 5:
+                    try:
+                        from tqdm import tqdm  # type: ignore
+
+                        progress_context = tqdm(total=K, desc="PF-ODE (GP samples)", leave=False)
+
+                        def iter_wrapper():
+                            for idx in range(K):
+                                yield idx
+                                progress_context.update(1)
+
+                        iterator = iter_wrapper()
+                    except ImportError:
+                        iterator = range(K)
+                else:
+                    iterator = range(K)
+
+                with progress_context:
+                    for _ in iterator:
+                        y_gp_sample, _ = sample_gp_conditional_fixed(
+                            dataset=cfg.dataset,
+                            x_target=x_query,
+                            x_context=x_ctx,
+                            y_context=y_ctx,
+                            include_obs_noise=include_obs_noise,
+                            generator=gp_rng,
+                        )
+
+                        logp_gp = vp_probflow_loglik_conditional(
+                            model=model,
+                            process=process,
+                            x_target=x_query,
+                            y_target0=y_gp_sample,
+                            x_context=x_ctx,
+                            y_context=y_ctx,
+                            mask_context=None,
+                            steps=500,
+                            hutch="rademacher",
+                        )
+                        pf_gp_lls.append(logp_gp.item())
+
+                pf_gp_lls_t = torch.tensor(pf_gp_lls) if pf_gp_lls else torch.tensor([0.0])
+
+                pf_mean = float(pf_gp_lls_t.mean().item())
+                pf_std = float(pf_gp_lls_t.std(unbiased=False).item()) if pf_gp_lls_t.numel() > 1 else 0.0
+                print(
+                    "[gp-sample/loglik] PF-ODE log-lik (mean±std): "
+                    f"{pf_mean:.3f} ± {pf_std:.3f} (K={len(pf_gp_lls)})"
+                )
+
+                out_json_gp_pf = out_path.with_suffix(f".gp_eval.fixed_pf_ctx{int(x_ctx.size(0))}.json")
+                payload_gp_pf = {
+                    "sampler": sampler,
+                    "num_steps": num_steps,
+                    "seed": seed,
+                    "K": len(pf_gp_lls),
+                    "M": x_ctx.size(0),
+                    "pf_loglik": {
+                        "mean": pf_mean,
+                        "std": pf_std,
+                        "per_sample": pf_gp_lls,
+                    },
+                }
+                out_json_gp_pf.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_json_gp_pf, "w") as f:
+                    json.dump(payload_gp_pf, f, indent=2)
+                print(f"✓ saved GP sample diffusion eval: {out_json_gp_pf}")
+                # --- KL(N(m,S) || q_theta) estimate via entropy + E_p[log q] ---
+                m_post, S_post, _ = gp_posterior_fixed(
+                    cfg.dataset,
+                    x_ctx=x_ctx,
+                    y_ctx=y_ctx,
+                    x_tgt=x_query,
+                    active_dims=list(range(cfg.input_dim)),
+                    include_obs_noise=include_obs_noise,
+                )
+
+                kl_stats = estimate_kl_from_pf_lls(torch.tensor(pf_gp_lls, dtype=torch.float64), S_post)
+                out_json_gp_pf_kl = out_path.with_suffix(f".gp_eval.fixed_pf_ctx{int(x_ctx.size(0))}.kl.json")
+                with open(out_json_gp_pf_kl, "w") as f:
+                    json.dump(kl_stats, f, indent=2)
+                print(f"✓ saved KL estimate (fixed PF vs model): {out_json_gp_pf_kl}")
+
+
+    if compute_noise:
+        pf_noise_lls: list[float] = []
+        noise_rng = torch.Generator(device=device)
+        noise_rng.manual_seed(seed + 54321)
+
+        iterator_noise: Iterable[int]
+        progress_context_noise = nullcontext()
+        if K > 5:
+            try:
+                from tqdm import tqdm  # type: ignore
+
+                progress_context_noise = tqdm(total=K, desc="PF-ODE (uniform noise)", leave=False)
+
+                def _iter_noise():
+                    for idx in range(K):
+                        yield idx
+                        progress_context_noise.update(1)
+
+                iterator_noise = _iter_noise()
+            except ImportError:
+                iterator_noise = range(K)
+        else:
+            iterator_noise = range(K)
+
+        x_range = (-2.0, 2.0)
+        y_range = (-1.0, 1.0)
+
+        with progress_context_noise:
+            for _ in iterator_noise:
+                x_noise = torch.rand(
+                    (n_points, cfg.input_dim),
+                    dtype=torch.float32,
+                    device=device,
+                    generator=noise_rng,
+                ).mul_(x_range[1] - x_range[0]).add_(x_range[0])
+                y_noise = torch.rand(
+                    (n_points, 1),
+                    dtype=torch.float32,
+                    device=device,
+                    generator=noise_rng,
+                ).mul_(y_range[1] - y_range[0]).add_(y_range[0])
+
+                logp_noise = vp_probflow_loglik_conditional(
+                    model=model,
+                    process=process,
+                    x_target=x_noise,
+                    y_target0=y_noise,
+                    x_context=None,
+                    y_context=None,
+                    mask_context=None,
+                    steps=500,
+                    hutch="rademacher",
+                )
+                pf_noise_lls.append(logp_noise.item())
+
+        pf_noise_t = torch.tensor(pf_noise_lls) if pf_noise_lls else torch.tensor([0.0])
+        pf_noise_mean = float(pf_noise_t.mean().item())
+        pf_noise_std = float(pf_noise_t.std(unbiased=False).item()) if pf_noise_t.numel() > 1 else 0.0
+        print(
+            "[noise/loglik] PF-ODE log-lik on uniform noise (mean±std): "
+            f"{pf_noise_mean:.3f} ± {pf_noise_std:.3f} (K={len(pf_noise_lls)})"
+        )
+
+        out_json_noise = out_path.with_suffix(".noise_pf.json")
+        payload_noise = {
+            "sampler": sampler,
+            "num_steps": num_steps,
+            "seed": seed,
+            "K": len(pf_noise_lls),
+            "x_range": x_range,
+            "y_range": y_range,
+            "pf_loglik": {
+                "mean": pf_noise_mean,
+                "std": pf_noise_std,
+                "per_sample": pf_noise_lls,
+            },
+        }
+        out_json_noise.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json_noise, "w") as f:
+            json.dump(payload_noise, f, indent=2)
+        print(f"�?saved uniform noise diffusion eval: {out_json_noise}")
+
+    if compute_real:
+        m, S, θ = _ensure_posterior()
+        t2 = time.perf_counter()
+
+        Nt = m.numel()
+        jitter = 1e-9
+        try:
+            L = torch.linalg.cholesky(S)
+        except RuntimeError:
+            L = torch.linalg.cholesky(S + jitter * torch.eye(Nt, dtype=S.dtype, device=S.device))
+
+        z = torch.randn((K, Nt), dtype=m.dtype, device=m.device)
+        y_samps = m.unsqueeze(0) + z @ L.T
+
+        x_plot = torch.cat([x_ctx, x_query], dim=0).squeeze(-1)
+        order = torch.argsort(x_plot)
+        xs_sorted_real = x_plot[order]
+
+        ys_rows_real = []
+        for k in range(K):
+            y_plot = torch.cat([y_ctx.squeeze(-1), y_samps[k].squeeze(-1)], dim=0)
+            ys_rows_real.append(y_plot[order])
+        ys_sorted_real = torch.stack(ys_rows_real, dim=0)
+
+        out_path_real_png = out_path.with_suffix(".real.png")
+        plot_conditional(
+            xs_sorted_real,
+            ys_sorted_real,
+            x_ctx.squeeze(-1),
+            y_ctx.squeeze(-1),
+            out_path_real_png,
+            title="Real GP baseline samples",
+        )
+
+        per_ll2, per_mahal2 = [], []
+        progress_context = nullcontext()
+        iterator_real: Iterable[int]
+        if K > 5:
+            try:
+                from tqdm import tqdm  # type: ignore
+
+                progress_context = tqdm(total=K, desc="PF-ODE (real GP)", leave=False)
+
+                def _iter_real():
+                    for idx in range(K):
+                        yield idx
+                        progress_context.update(1)
+
+                iterator_real = _iter_real()
+            except ImportError:
+                iterator_real = range(K)
+        else:
+            iterator_real = range(K)
+
+        with progress_context:
+            for k in iterator_real:
+                yk = y_samps[k]
+                per_ll2.append(mvn_loglik(yk, m, S).detach().cpu().item())
+                per_mahal2.append(mahalanobis2(yk, m, S).detach().cpu().item())
+
+        ll = torch.tensor(per_ll2)
+        q = torch.tensor(per_mahal2)
+
+        stats2 = {
+            "ell_eff": float(θ.ell_eff),
+            "var": float(θ.var),
+            "noise": float(θ.noise),
+            "mean_ll": float(ll.mean().item()),
+            "std_ll": float(ll.std(unbiased=False).item()),
+            "mean_mahal": float(q.mean().item()),
+            "std_mahal": float(q.std(unbiased=False).item()),
+            "K": int(K),
+            "N": int(Nt),
+            "include_obs_noise": bool(include_obs_noise),
+        }
+
+        print(
+            "[gp-real/baseline] GP hypers:",
+            f"ell_eff={stats2['ell_eff']:.4g}, var={stats2['var']:.4g}, noise={stats2['noise']:.4g}"
+        )
+        print(
+            "[gp-real/baseline] LL (mean±std over K): ",
+            f"{stats2['mean_ll']:.3f} ± {stats2['std_ll']:.3f}"
+        )
+        print(
+            "[gp-real/baseline] Mahalanobis^2 (mean±std): ",
+            f"{stats2['mean_mahal']:.3f} ± {stats2['std_mahal']:.3f}"
+        )
+        print(f"[gp-real/baseline] computed in {time.perf_counter()-t2:.2f}s")
+
+        out_json2 = out_path.with_suffix(f".gp_eval.real_ctx{int(x_ctx.size(0))}.json")
+        payload2 = {
+            "sampler": sampler,
+            "num_steps": num_steps,
+            "seed": seed,
+            "K": stats2["K"],
+            "N": stats2["N"],
+            "include_obs_noise": stats2["include_obs_noise"],
+            "gp_hypers": {
+                "ell_eff": stats2["ell_eff"],
+                "var": stats2["var"],
+                "noise": stats2["noise"],
+            },
+            "likelihood": {
+                "mean": stats2["mean_ll"],
+                "std": stats2["std_ll"],
+                "per_sample": per_ll2,
+            },
+            "mahalanobis2": {
+                "mean": stats2["mean_mahal"],
+                "std": stats2["std_mahal"],
+                "per_sample": per_mahal2,
+            },
+        }
+        out_json2.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json2, "w") as f:
+            json.dump(payload2, f, indent=2)
+        print(f"✓ saved GP eval (real/baseline): {out_json2}")
+
+        # Score GP posterior samples under the diffusion model (score matching diagnostic)
+        # pf_lls = []
+        # for k in range(K):
+        #     yk = y_samps[k].view(-1, 1).to(dtype=x_query.dtype, device=x_query.device)
+        #     logp_k = vp_probflow_loglik_conditional(
+        #         model=model,
+        #         process=process,
+        #         x_target=x_query,
+        #         y_target0=yk,
+        #         x_context=x_ctx,
+        #         y_context=y_ctx,
+        #         mask_context=None,
+        #         steps=500,
+        #         hutch="rademacher",
+        #     )
+        #     pf_lls.append(logp_k.item())
+        #
+        # pf_lls_tensor = torch.tensor(pf_lls)
+        # pf_mean = float(pf_lls_tensor.mean().item())
+        # pf_std = float(pf_lls_tensor.std(unbiased=False).item()) if pf_lls_tensor.numel() > 1 else 0.0
+        # print(
+        #     "[gp-real/score-matching] PF-ODE log-lik (mean±std): "
+        #     f"{pf_mean:.3f} ± {pf_std:.3f}"
+        # )
+        #
+        # out_json_pf = out_path.with_suffix(f".gp_eval.real_pf_ctx{int(x_ctx.size(0))}.json")
+        # payload_pf = {
+        #     "sampler": sampler,
+        #     "num_steps": num_steps,
+        #     "seed": seed,
+        #     "K": stats2["K"],
+        #     "N": stats2["N"],
+        #     "pf_loglik": {
+        #         "mean": pf_mean,
+        #         "std": pf_std,
+        #         "per_sample": pf_lls,
+        #     },
+        # }
+        # out_json_pf.parent.mkdir(parents=True, exist_ok=True)
+        # with open(out_json_pf, "w") as f:
+        #     json.dump(payload_pf, f, indent=2)
+        # print(f"✓ saved diffusion score eval (real): {out_json_pf}")
+        # # --- KL(N(m,S) || q_theta) using the same samples and the analytic entropy ---
+        # kl_stats_real = estimate_kl_from_pf_lls(torch.tensor(pf_lls, dtype=torch.float64), S)
+        # out_json_pf_kl = out_path.with_suffix(f".gp_eval.real_pf_ctx{int(x_ctx.size(0))}.kl.json")
+        # with open(out_json_pf_kl, "w") as f:
+        #     json.dump(kl_stats_real, f, indent=2)
+        # print(f"✓ saved KL estimate (real PF vs model): {out_json_pf_kl}")
+
+
+    if compute_ceiling:
+        m, S, θ = _ensure_posterior()
+        Nt = m.numel()
+
+        x_plot = torch.cat([x_ctx, x_query], dim=0).squeeze(-1)
+        order = torch.argsort(x_plot)
+        xs_sorted_ceiling = x_plot[order]
+        y_mean_plot = torch.cat([y_ctx.squeeze(-1), m.view(-1)], dim=0)[order]
+        out_path_ceiling_png = out_path.with_suffix(".ceiling.png")
+        plot_conditional(
+            xs_sorted_ceiling,
+            y_mean_plot,
+            x_ctx.squeeze(-1),
+            y_ctx.squeeze(-1),
+            out_path_ceiling_png,
+            title="Real GP posterior mean (ceiling)",
+        )
+
+        ll_ceiling = mvn_loglik(m, m, S).detach().cpu().item()
+        q_ceiling = 0.0
+
+        stats3 = {
+            "ell_eff": float(θ.ell_eff),
+            "var": float(θ.var),
+            "noise": float(θ.noise),
+            "mean_ll": float(ll_ceiling),
+            "std_ll": 0.0,
+            "mean_mahal": float(q_ceiling),
+            "std_mahal": 0.0,
+            "K": int(K),
+            "N": int(Nt),
+            "include_obs_noise": bool(include_obs_noise),
+        }
+        print(
+            "[gp-real/ceiling]  LL (max at mean): ",
+            f"{stats3['mean_ll']:.3f}; Mahalanobis^2={stats3['mean_mahal']:.1f} (q=0 at mean)"
+        )
+
+        out_json3 = out_path.with_suffix(".gp_eval.ceiling.json")
+        payload3 = {
+            "sampler": sampler,
+            "num_steps": num_steps,
+            "seed": seed,
+            "K": stats3["K"],
+            "N": stats3["N"],
+            "include_obs_noise": stats3["include_obs_noise"],
+            "gp_hypers": {
+                "ell_eff": stats3["ell_eff"],
+                "var": stats3["var"],
+                "noise": stats3["noise"],
+            },
+            "likelihood": {
+                "mean": stats3["mean_ll"],
+                "std": stats3["std_ll"],
+                "per_sample": [ll_ceiling for _ in range(K)],
+            },
+            "mahalanobis2": {
+                "mean": stats3["mean_mahal"],
+                "std": stats3["std_mahal"],
+                "per_sample": [0.0 for _ in range(K)],
+            },
+        }
+        out_json3.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json3, "w") as f:
+            json.dump(payload3, f, indent=2)
+        print(f"✓ saved GP eval (ceiling): {out_json3}")
+
+    return False
+
 # ----------------------------- Main -----------------------------
 
 def main(
@@ -358,6 +1026,9 @@ def main(
     compute_real: bool = False,  # sample from real GP posterior and score
     compute_ceiling: bool = False,  # score posterior mean
     include_obs_noise: bool = True,
+    compute_gp_sample_loglik: bool = False,  # draw GP posterior sample then score via diffusion
+    compute_noise: bool = False,
+    num_context: int = 10,
 ):
 
     cfg = Config()  # or Config.from_file(...)
@@ -367,246 +1038,91 @@ def main(
     ckpt_path = Path(ckpt) if ckpt is not None else find_latest_ckpt()
     if ckpt_path is None or not ckpt_path.exists():
         raise SystemExit(
-            f"[!] No checkpoint found.\n"
-            f"    Looked for latest under: {DEFAULT_LOG_ROOT}\n"
+            f"[!] No checkpoint found.\\n"
+            f"    Looked for latest under: {DEFAULT_LOG_ROOT}\\n"
             f"    Or pass an explicit path to main(ckpt=...)."
         )
-    print(f"Using checkpoint: {ckpt_path}")
 
     model = load_ema_model(cfg, device, ckpt_path)
     process = build_process(cfg, device)
 
-    # Conditional
-    if cfg.input_dim != 1:
-        raise ValueError("Conditional plotting assumes input_dim == 1.")
+    if cfg.dataset not in {"se", "matern"}:
+        raise ValueError("This evaluation path currently supports only GP datasets ('se' or 'matern').")
 
-    # Build a random context from the generator (batch_size=1)
-    batch: Batch = get_batch(
-        torch.Generator().manual_seed(cfg.seed + 1),
-        batch_size=1,
-        name=cfg.dataset,
-        task="interpolation",
-        input_dim=cfg.input_dim,
+    if device.type == "cpu":
+        rng_device = "cpu"
+    else:
+        rng_device = f"{device.type}:{device.index or 0}"
+    prior_rng = torch.Generator(device=rng_device)
+    device = torch.device(rng_device)
+    prior_rng.manual_seed(seed)
+
+    num_context = max(0, int(num_context))
+    if num_context > 0:
+        x_ctx = torch.rand(
+            (num_context, cfg.input_dim),
+            device=device,
+            dtype=torch.float32,
+            generator=prior_rng,
+        ).mul_(4.0).sub_(2.0)
+        y_ctx, _ = sample_gp_conditional_fixed(
+            dataset=cfg.dataset,
+            x_target=x_ctx,
+            include_obs_noise=include_obs_noise,
+            generator=prior_rng,
+        )
+    else:
+        x_ctx = torch.empty((0, cfg.input_dim), device=device, dtype=torch.float32)
+        y_ctx = torch.empty((0, 1), device=device, dtype=torch.float32)
+
+    x_query = torch.linspace(-2, 2, n_points, device=device, dtype=torch.float32).unsqueeze(-1)
+
+    out_path = out_path.with_name(f"{out_path.stem}_ctx{num_context}{out_path.suffix}")
+
+    should_exit = run_evaluations(
+        mode=mode,
+        cfg=cfg,
+        model=model,
+        process=process,
         device=device,
+        n_points=n_points,
+        n_funcs=n_funcs,
+        seed=seed,
+        sampler=sampler,
+        num_steps=num_steps,
+        K=K,
+        include_obs_noise=include_obs_noise,
+        out_path=out_path,
+        x_ctx=x_ctx,
+        y_ctx=y_ctx,
+        x_query=x_query,
+        compute_fixed=compute_fixed,
+        compute_real=compute_real,
+        compute_ceiling=compute_ceiling,
+        compute_gp_sample_loglik=compute_gp_sample_loglik,
+        compute_noise=compute_noise,
     )
-    x_ctx, y_ctx = batch.x_context[0], batch.y_context[0]  # [M,1], [M,1]
-    x_query = torch.linspace(-2, 2, n_points, device=device).unsqueeze(-1)  # [N,1]
 
-    t0 = time.time()
-
-    if compute_fixed:
-        #plot_exact_like_training(model, process, cfg, device, "samples/like_training.png")
-        print(f"[timing] plot_exact_like_training took {time.time() - t0:.2f} sec")
-
-        # Unconditional
-        if mode == "uncond":
-            if cfg.input_dim != 1:
-                raise ValueError("Unconditional plotting assumes input_dim == 1.")
-            print(f"[timing] → start sample_uncond/{sampler} "
-                  f"({('T=' + str(process.betas.numel())) if sampler=='ddpm' else ('S=' + str(num_steps))}, "
-                  f"n_funcs={n_funcs})")
-            t0 = time.perf_counter()
-            x, ys = sample_uncond(cfg, model, process, device,
-                                  n_points=n_points, n_funcs=n_funcs, seed=seed,
-                                  sampler=sampler, num_steps=num_steps)
-            print(f"[timing] ← end   sample_uncond/{sampler}: {time.perf_counter()-t0:.2f}s")
-            plot_uncond(x, ys, out_path, title="Unconditional samples")
-            print(f"✓ saved: {out_path}")
-            return
-
-
-
-        print(f"[timing] → start sample_cond/{sampler} "
-              f"({('T=' + str(process.betas.numel())) if sampler=='ddpm' else ('S=' + str(num_steps))}, K={K})")
-        t0 = time.perf_counter()
-        xs, ys = sample_cond(cfg, model, process, device,
-                             x_context=x_ctx, y_context=y_ctx, x_query=x_query, seed=seed,
-                             sampler=sampler, num_steps=num_steps, K=K)
-        print(f"[timing] ← end   sample_cond/{sampler}: {time.perf_counter()-t0:.2f}s")
-        plot_conditional(xs, ys, x_ctx.squeeze(-1), y_ctx.squeeze(-1), out_path, title="Conditional sample")
-        print(f"✓ saved: {out_path}")
-
-
-        # ==== GP-likeness under the *fixed* GP (matches data.py) ====
-        t1 = time.perf_counter()
-        stats, per_ll, per_mahal = evaluate_gp_likeness_from_sorted_fixed(
-            dataset_name=cfg.dataset,
-            input_dim=cfg.input_dim,
-            x_ctx=x_ctx, y_ctx=y_ctx,
-            x_query=x_query,
-            xs_sorted=xs, ys_sorted=ys,
-            include_obs_noise=include_obs_noise,     # True: score y (with noise), False: latent f
-        )
-        print("[gp-like/fixed] GP hypers:",
-              f"ell_eff={stats['ell_eff']:.4g}, var={stats['var']:.4g}, noise={stats['noise']:.4g}")
-        print("[gp-like/fixed] LL (mean±std over K): "
-              f"{stats['mean_ll']:.3f} ± {stats['std_ll']:.3f}")
-        print("[gp-like/fixed] Mahalanobis^2 (mean±std): "
-              f"{stats['mean_mahal']:.3f} ± {stats['std_mahal']:.3f}")
-        print(f"[gp-like/fixed] computed in {time.perf_counter() - t1:.2f}s")
-
-        # Save numbers next to the plot
-        out_json = out_path.with_suffix(".gp_eval.fixed.json")
-        payload = {
-            "sampler": sampler, "num_steps": num_steps, "seed": seed,
-            "K": stats["K"], "N": stats["N"], "include_obs_noise": stats["include_obs_noise"],
-            "gp_hypers": {"ell_eff": stats["ell_eff"], "var": stats["var"], "noise": stats["noise"]},
-            "likelihood": {"mean": stats["mean_ll"], "std": stats["std_ll"], "per_sample": per_ll},
-            "mahalanobis2": {"mean": stats["mean_mahal"], "std": stats["std_mahal"], "per_sample": per_mahal},
-        }
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_json, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"✓ saved GP eval (fixed): {out_json}")
-
-
-    # ==== Shared posterior (for real/ceiling) ====
-    m = S = θ = None
-    if (compute_real or compute_ceiling):
-        m, S, θ = gp_posterior_fixed(
-            cfg.dataset, x_ctx, y_ctx, x_query, list(range(cfg.input_dim)),
-            include_obs_noise=include_obs_noise
-        )
-
-    # ==== 'Real' GP baseline: sample from the true posterior and score under it ====
-    if compute_real:
-        t2 = time.perf_counter()
-
-        # Compute true GP posterior once from (X_C, y_C) to the query grid X_T
-        m, S, θ = gp_posterior_fixed(
-            cfg.dataset, x_ctx, y_ctx, x_query, list(range(cfg.input_dim)),
-            include_obs_noise=include_obs_noise
-        )
-
-        Nt = m.numel()
-        # Cholesky (with tiny jitter for numerical safety)
-        jitter = 1e-9
-        try:
-            L = torch.linalg.cholesky(S)
-        except RuntimeError:
-            L = torch.linalg.cholesky(S + jitter * torch.eye(Nt, dtype=S.dtype, device=S.device))
-
-        # Draw K i.i.d. posterior samples and score each under N(m,S)
-        z = torch.randn((K, Nt), dtype=m.dtype, device=m.device)
-        y_samps = m.unsqueeze(0) + z @ L.T  # [K, Nt]
-
-        # Build plotting grid xs_sorted and combine with context for visualization
-        x_plot = torch.cat([x_ctx, x_query], dim=0).squeeze(-1)  # [M+N]
-        order = torch.argsort(x_plot)  # [M+N]
-        xs_sorted_real = x_plot[order]
-
-        ys_rows_real = []
-        for k in range(K):
-            y_plot = torch.cat([y_ctx.squeeze(-1), y_samps[k].squeeze(-1)], dim=0)  # [M+N]
-            ys_rows_real.append(y_plot[order])
-        ys_sorted_real = torch.stack(ys_rows_real, dim=0)  # [K, M+N]
-
-        # Plot baseline samples
-        out_path_real_png = out_path.with_suffix(".real.png")
-        plot_conditional(xs_sorted_real, ys_sorted_real, x_ctx.squeeze(-1), y_ctx.squeeze(-1),
-                         out_path_real_png, title="Real GP baseline samples")
-
-        per_ll2, per_mahal2 = [], []
-        for k in range(K):
-            yk = y_samps[k]
-            per_ll2.append(mvn_loglik(yk, m, S).detach().cpu().item())
-            per_mahal2.append(mahalanobis2(yk, m, S).detach().cpu().item())
-
-        ll = torch.tensor(per_ll2)
-        q  = torch.tensor(per_mahal2)
-
-        stats2 = {
-            "ell_eff": float(θ.ell_eff), "var": float(θ.var), "noise": float(θ.noise),
-            "mean_ll": float(ll.mean().item()), "std_ll": float(ll.std(unbiased=False).item()),
-            "mean_mahal": float(q.mean().item()), "std_mahal": float(q.std(unbiased=False).item()),
-            "K": int(K), "N": int(Nt),
-            "include_obs_noise": bool(include_obs_noise),
-        }
-
-        print("[gp-real/baseline] GP hypers:",
-              f"ell_eff={stats2['ell_eff']:.4g}, var={stats2['var']:.4g}, noise={stats2['noise']:.4g}")
-        print("[gp-real/baseline] LL (mean±std over K): "
-              f"{stats2['mean_ll']:.3f} ± {stats2['std_ll']:.3f}")
-        print("[gp-real/baseline] Mahalanobis^2 (mean±std): "
-              f"{stats2['mean_mahal']:.3f} ± {stats2['std_mahal']:.3f}")
-        print(f"[gp-real/baseline] computed in {time.perf_counter() - t2:.2f}s")
-
-        out_json2 = Path("samples") / "gp_eval.baseline.json"
-        payload2 = {
-            "sampler": sampler, "num_steps": num_steps, "seed": seed,
-            "K": stats2["K"], "N": stats2["N"], "include_obs_noise": stats2["include_obs_noise"],
-            "gp_hypers": {"ell_eff": stats2["ell_eff"], "var": stats2["var"], "noise": stats2["noise"]},
-            "likelihood": {"mean": stats2["mean_ll"], "std": stats2["std_ll"], "per_sample": per_ll2},
-            "mahalanobis2": {"mean": stats2["mean_mahal"], "std": stats2["std_mahal"], "per_sample": per_mahal2},
-        }
-        out_json2.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_json2, "w") as f:
-            json.dump(payload2, f, indent=2)
-        print(f"✓ saved GP eval (real/baseline): {out_json2}")
-
-
-
-
-        # ---- Ceiling: evaluate the posterior mean m under N(m, S) ----
-        # This is the maximum log-likelihood point (q=0). We replicate K entries for convenience.
-        # ---- Ceiling: evaluate the posterior mean m under N(m, S) ----
-        if compute_ceiling:
-            # m, S, θ are computed above in the shared-posterior section
-            Nt = m.numel()
-            # Plot the posterior mean as a single curve
-            x_plot = torch.cat([x_ctx, x_query], dim=0).squeeze(-1)
-            order = torch.argsort(x_plot)
-            xs_sorted_ceiling = x_plot[order]
-            y_mean_plot = torch.cat([y_ctx.squeeze(-1), m.view(-1)], dim=0)[order]
-            out_path_ceiling_png = out_path.with_suffix(".ceiling.png")
-            plot_conditional(xs_sorted_ceiling, y_mean_plot, x_ctx.squeeze(-1), y_ctx.squeeze(-1),
-                             out_path_ceiling_png, title="Real GP posterior mean (ceiling)")
-
-            ll_ceiling = mvn_loglik(m, m, S).detach().cpu().item()
-            q_ceiling = 0.0
-
-            stats3 = {
-                "ell_eff": float(θ.ell_eff), "var": float(θ.var), "noise": float(θ.noise),
-                "mean_ll": float(ll_ceiling), "std_ll": 0.0,
-                "mean_mahal": float(q_ceiling), "std_mahal": 0.0,
-                "K": int(K), "N": int(Nt),
-                "include_obs_noise": bool(include_obs_noise),
-            }
-            print("[gp-real/ceiling]  LL (max at mean): "
-                  f"{stats3['mean_ll']:.3f}; Mahalanobis^2={stats3['mean_mahal']:.1f} (q=0 at mean)")
-
-            out_json3 = out_path.with_suffix(".gp_eval.ceiling.json")
-            payload3 = {
-                "sampler": sampler, "num_steps": num_steps, "seed": seed,
-                "K": stats3["K"], "N": stats3["N"], "include_obs_noise": stats3["include_obs_noise"],
-                "gp_hypers": {"ell_eff": stats3["ell_eff"], "var": stats3["var"], "noise": stats3["noise"]},
-                "likelihood": {"mean": stats3["mean_ll"], "std": stats3["std_ll"],
-                               "per_sample": [ll_ceiling for _ in range(K)]},
-                "mahalanobis2": {"mean": stats3["mean_mahal"], "std": stats3["std_mahal"],
-                                 "per_sample": [0.0 for _ in range(K)]},
-            }
-            out_json3.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_json3, "w") as f:
-                json.dump(payload3, f, indent=2)
-            print(f"✓ saved GP eval (ceiling): {out_json3}")
-
+    if should_exit:
+        return
 
 
 if __name__ == "__main__":
-    ckpt_file = Path("logs/regression/Sep09_205729_tyui/model_ema.pt")
+    ckpt_file = Path("logs/regression/Sep29_220939_nljq_drop10/model_ema.pt")
     sampler = "ddpm"
-    num_steps = 25
-    K = 30
+    num_steps = 500
+    K = 30  # number of conditional samples
     main(
         ckpt=ckpt_file,
         mode="cond",          # or "uncond"
         n_points=50,
-        n_funcs=8,
+        n_funcs=30,   # number of vanilla samples
         seed=10,
         sampler=sampler,       # "ddpm" | "ddim" | "euler" | "heun"
         num_steps=num_steps,         # (used by ddim/euler/heun)
         K=K,
-        out_path=Path(f"logs/regression/Sep09_205729_tyui/out_{sampler}_steps{num_steps}_K{K}.png"),
-        compute_fixed = True, compute_real = False, compute_ceiling = False
+        num_context=5,
+        out_path=Path(f"logs/regression/Sep29_220939_nljq_drop10/out_{sampler}_steps{num_steps}_K{K}.png"),
+        compute_fixed = True, compute_real = False, compute_ceiling = False,
+        compute_gp_sample_loglik = True  # control whether to compute PF-ODE log-lik for fixed
     )
-
