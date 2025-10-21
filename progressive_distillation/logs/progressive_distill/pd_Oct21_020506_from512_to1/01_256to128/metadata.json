@@ -1,0 +1,9 @@
+{
+  "stage_index": 1,
+  "src_steps": 256,
+  "dst_steps": 128,
+  "updates": 128000,
+  "ema_decay": 0.995,
+  "learning_rate": 0.001,
+  "final_loss": 0.026297789350641143
+}
