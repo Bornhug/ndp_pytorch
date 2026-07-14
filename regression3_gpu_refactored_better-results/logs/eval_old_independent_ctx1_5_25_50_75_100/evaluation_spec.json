@@ -1,0 +1,76 @@
+{
+  "runs_root": "C:\\Users\\apex\\Code\\Python\\ndp_pytorch_ctx\\regression3_gpu_refactored_better-results\\pretrained\\matched_549441_seed42",
+  "contexts": [
+    1,
+    5,
+    25,
+    50,
+    75,
+    100
+  ],
+  "num_targets": 50,
+  "samples": 100,
+  "task_seed": 10,
+  "gp_sample_seed": 98775,
+  "model_sample_seed": 10,
+  "context_separation": 0.05,
+  "prefix_count": 50,
+  "prefix_separation": 0.05,
+  "sampling_steps": 500,
+  "batch_size": 100,
+  "output_dir": "C:\\Users\\apex\\Code\\Python\\ndp_pytorch_ctx\\regression3_gpu_refactored_better-results\\logs\\eval_old_independent_ctx1_5_25_50_75_100",
+  "task_construction": "independent",
+  "model_rng_semantics": "historical",
+  "gp_sample_rng_semantics": "historical-batched",
+  "context_separation_overrides": [
+    [
+      75,
+      0.01
+    ],
+    [
+      100,
+      0.01
+    ]
+  ],
+  "implementation_version": 4,
+  "sampling_semantics_version": 1,
+  "task_construction_version": "independent_historical_v1",
+  "gp": {
+    "kernel": "matern52",
+    "lengthscale": 0.25,
+    "variance": 1.0,
+    "observation_noise_std": 0.05,
+    "target_noise": "observed",
+    "cholesky_jitter": 1e-06,
+    "x_bounds": [
+      -2.0,
+      2.0
+    ],
+    "query_layout": "linspace"
+  },
+  "models": {
+    "ndp_cond": {
+      "checkpoint": "C:\\Users\\apex\\Code\\Python\\ndp_pytorch_ctx\\regression3_gpu_refactored_better-results\\pretrained\\matched_549441_seed42\\ndp_cond\\checkpoint.pt",
+      "checkpoint_sha256": "fab8e5a40e021054fe2e3c0ccce432931e4bdb4d6f27d9ca0b15bbbfc1e7f86e",
+      "step": 128000,
+      "ema_weights": true,
+      "parameters": 549441
+    },
+    "ndp_uncond": {
+      "checkpoint": "C:\\Users\\apex\\Code\\Python\\ndp_pytorch_ctx\\regression3_gpu_refactored_better-results\\pretrained\\matched_549441_seed42\\ndp_uncond\\checkpoint.pt",
+      "checkpoint_sha256": "8c1ee6f2f7cd5eae01aec40ae1835e78541c22b13edba2239bd2c614d6d529ed",
+      "step": 128000,
+      "ema_weights": true,
+      "parameters": 549441
+    },
+    "flownp": {
+      "checkpoint": "C:\\Users\\apex\\Code\\Python\\ndp_pytorch_ctx\\regression3_gpu_refactored_better-results\\pretrained\\matched_549441_seed42\\flownp\\checkpoint.pt",
+      "checkpoint_sha256": "67840510ab2b7b45ddd39f95acddaa3c8c54f3151e74bf55173d8f9979f4e8a0",
+      "step": 128000,
+      "ema_weights": true,
+      "parameters": 549441
+    }
+  },
+  "sampling_semantics_sha256": "c32dc61296119c45088d23a7c19b6dae745a9489989cd6e7d60b38181d001bd0",
+  "spec_sha256": "c32dc61296119c45088d23a7c19b6dae745a9489989cd6e7d60b38181d001bd0"
+}
