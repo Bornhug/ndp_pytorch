@@ -1,0 +1,122 @@
+{
+  "backend": "flownp",
+  "recipe": "legacy_parity",
+  "data": {
+    "dataset": "matern",
+    "input_dim": 1,
+    "batch_size": 32,
+    "x_min": -2.0,
+    "x_max": 2.0,
+    "train_num_target_min": 32,
+    "train_num_target_max": 64,
+    "train_num_context_min": 0,
+    "train_num_context_max": 32,
+    "eval_num_target": 50,
+    "eval_num_context_min": 1,
+    "eval_num_context_max": 40,
+    "context_drop_probability": 0.0
+  },
+  "diffusion": {
+    "schedule": "cosine",
+    "beta_start": 0.0003,
+    "beta_end": 0.5,
+    "timesteps": 500
+  },
+  "network": {
+    "n_layers": 4,
+    "hidden_dim": 64,
+    "num_heads": 8
+  },
+  "ndp": {
+    "timestep_sampling": "stratified",
+    "repaint_inner_steps": 5,
+    "repaint_context_noise": "fresh",
+    "ddim_eta": 0.0
+  },
+  "flownp": {
+    "dim_posenc": 24,
+    "embedding_depth": 4,
+    "num_layers": 6,
+    "hidden_dim": 100,
+    "num_heads": 4,
+    "feedforward_dim": 200,
+    "predictor_hidden_dim": 270,
+    "dropout": 0.0,
+    "time_sampling": "per_function",
+    "time_distribution": "stratified",
+    "output_dim": 1,
+    "repo_noise_scale": 0.2
+  },
+  "optimizer": {
+    "num_warmup_epochs": 20,
+    "warmup_steps": 500,
+    "num_decay_epochs": 200,
+    "init_lr": 2e-05,
+    "peak_lr": 0.001,
+    "end_lr": 1e-05,
+    "ema_rate": 0.995,
+    "weight_decay": 0.0,
+    "beta1": 0.9,
+    "beta2": 0.999
+  },
+  "training": {
+    "seed": 42,
+    "num_epochs": 250,
+    "samples_per_epoch": 16384,
+    "loss_type": "l1",
+    "num_workers": 4,
+    "prefetch_factor": 2,
+    "pin_memory": true,
+    "grad_clip_norm": 1.0,
+    "log_every": 100,
+    "num_sample_plots": 8,
+    "resume": ""
+  },
+  "sampling": {
+    "sampler": "euler",
+    "num_steps": 500,
+    "num_points": 50,
+    "num_functions": 8,
+    "num_conditional_samples": 30,
+    "seed": 10
+  },
+  "likelihood": {
+    "convention": "flow_cnf",
+    "include_observation_noise": true,
+    "steps": 500,
+    "divergence": "exact",
+    "hutchinson": "rademacher",
+    "hutchinson_probes": 1,
+    "integrator": "solve_ivp",
+    "rtol": 1e-05,
+    "atol": 1e-05,
+    "epsilon": 1e-05
+  },
+  "evaluation": {
+    "profile": "full",
+    "mode": "cond",
+    "contexts": [
+      1,
+      5,
+      10,
+      15,
+      20,
+      30,
+      40
+    ],
+    "compute_fixed": true,
+    "compute_real": false,
+    "compute_ceiling": false,
+    "compute_model_likelihood": true,
+    "compute_noise": false
+  },
+  "logging": {
+    "use_wandb": false,
+    "wandb_project": "flownp_joint_noisy_param_matched",
+    "wandb_watch_gradients": false
+  },
+  "paths": {
+    "output_root": "regression3_gpu_refactored/logs/regression/flownp_joint_noisy_param_matched",
+    "export_root": "regression3_gpu_refactored/data"
+  }
+}
