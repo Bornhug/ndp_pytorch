@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "bundle": "matched_549441_seed42",
+  "description": "Parameter-matched step-128000 GP-regression checkpoints bundled for standalone evaluation.",
+  "models": {
+    "ndp_cond": {
+      "backend": "ndp_cond",
+      "trainable_parameters": 549441,
+      "checkpoint_step": 128000,
+      "ema_state": "ema_model",
+      "checkpoint": {
+        "path": "ndp_cond/checkpoint.pt",
+        "bytes": 8872487,
+        "sha256": "fab8e5a40e021054fe2e3c0ccce432931e4bdb4d6f27d9ca0b15bbbfc1e7f86e"
+      },
+      "config": {
+        "path": "ndp_cond/config.json",
+        "bytes": 2785,
+        "sha256": "3ac931e519f6cf183dc1337d7f62d637a93869faef838551e7346f0c3422f3c3"
+      }
+    },
+    "ndp_uncond": {
+      "backend": "ndp_uncond",
+      "trainable_parameters": 549441,
+      "checkpoint_step": 128000,
+      "ema_state": "ema_model",
+      "checkpoint": {
+        "path": "ndp_uncond/checkpoint.pt",
+        "bytes": 8872487,
+        "sha256": "8c1ee6f2f7cd5eae01aec40ae1835e78541c22b13edba2239bd2c614d6d529ed"
+      },
+      "config": {
+        "path": "ndp_uncond/config.json",
+        "bytes": 2791,
+        "sha256": "f8550f3efe09f6c05d471a282dcf4e2d2aaf2052b3930fc0f35c4dbdd2e2a1b4"
+      }
+    },
+    "flownp": {
+      "backend": "flownp",
+      "trainable_parameters": 549441,
+      "checkpoint_step": 128000,
+      "ema_state": "ema_model",
+      "checkpoint": {
+        "path": "flownp/checkpoint.pt",
+        "bytes": 8926949,
+        "sha256": "67840510ab2b7b45ddd39f95acddaa3c8c54f3151e74bf55173d8f9979f4e8a0"
+      },
+      "config": {
+        "path": "flownp/config.json",
+        "bytes": 2824,
+        "sha256": "0c5e8095835318e222ccc6f7e372e423074dea9d601204075e2ac76fc9f18dae"
+      }
+    }
+  }
+}
